@@ -17,6 +17,9 @@ This repo uses the standard engineering skill suite. Per-repo configuration:
 
 - **Work units are GitHub issues** (RAG-1..RAG-8) — one vertical slice each,
   test-first, landing green
+- **Landing path**: every issue lands via a feature branch + PR —
+  `gh pr create --title "..." --body "Closes #N"`; never push work directly
+  to `main`. (RAG-1 was the one-time exception that made this rule.)
 - **Acceptance authority**: the eval harness — every retrieval change must
   measurably beat the previous strategy (or document the gap); `cargo test`
   + CI (fmt, clippy) gate merges
