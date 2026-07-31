@@ -11,12 +11,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # devbox provisions the exact local toolchain — rustup + ripgrep per
+      # devbox.json, versions pinned by devbox.lock — so CI matches the dev
+      # environment (determinism: same manifest -> same corpus -> same gates).
+      # No separate toolchain action, no manual package installs.
+      - uses: jetify-com/devbox-install-action@v0.15.0
         with:
-          components: rustfmt, clippy
+          enable-cache: true
       - uses: Swatinem/rust-cache@v2
-      # The full-text baseline tests need `rg`; without it they silently skip.
-      - run: sudo apt-get update && sudo apt-get install -y ripgrep
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: devbox run -- cargo fmt --check
+      - run: devbox run -- cargo clippy --all-targets -- -D warnings
+      - run: devbox run -- cargo test
