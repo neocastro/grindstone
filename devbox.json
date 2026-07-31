@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.17.2/.schema/devbox.schema.json",
+  "packages": [
+    "rustup@latest",
+    "ripgrep@latest"
+  ],
+  "shell": {
+    "init_hook": [
+      "rustup default stable"
+    ]
+  }
+}

@@ -2,8 +2,9 @@
 /target
 **/*.rs.bk
 
-# Corpus / index state (machine-local; regenerable from the manifest)
-/corpus
+# Corpus / index state. The pinned manifest.json IS committed (it is the
+# reproducibility pin); the downloaded html files are regenerable state.
+/corpus/*.html
 /index.sqlite3
 
 # Local tooling state

@@ -8,3 +8,6 @@ description = "Local RAG engine: ingest, chunk, embed, retrieve, eval"
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.11"
+hex = "0.4"
+ureq = "2.12"
