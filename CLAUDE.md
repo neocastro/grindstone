@@ -26,3 +26,7 @@ This repo uses the standard engineering skill suite. Per-repo configuration:
 - **Determinism**: same manifest → same corpus → same index; rebuilds must be
   reproducible
 - **Toolchain**: devbox (`rustup`); Ollama serves `nomic-embed-text` (local)
+- **Use `rtk` for shell commands whenever possible** — it filters/summarizes
+  output before it hits context (e.g. `rtk ls`, `rtk read`, `rtk git`,
+  `rtk gh`, `rtk diff`, `rtk test`, `rtk err`). Saves tokens on every
+  command; prefer it over bare `ls`/`cat`/`git`/`gh`/`cargo test` output.
