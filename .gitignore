@@ -7,6 +7,16 @@
 /corpus/*.html
 /index.sqlite3
 
+# Minigraf temporal memory (machine session state; the graph + FTS index are
+# regenerable — see the temporal-reasoning skill used in tlarc).
+/memory.graph
+/memory.graph.fts.sqlite3
+
+# Temporal-reasoning skill wiring (.mcp.json + .claude carry machine-specific
+# paths, same convention as tlarc).
+/.mcp.json
+/.claude/
+
 # Local tooling state
 /.codewhale/
 
