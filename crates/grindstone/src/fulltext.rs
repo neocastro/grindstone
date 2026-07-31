@@ -32,9 +32,6 @@ pub fn search(corpus_dir: &Path, query: &str) -> Result<Vec<Hit>, FulltextError>
     if query.is_empty() {
         return Ok(Vec::new());
     }
-    if !ripgrep_present() {
-        return Err(FulltextError::MissingRipgrep);
-    }
 
     let mut files: Vec<_> = std::fs::read_dir(corpus_dir)
         .map_err(FulltextError::Io)?
@@ -43,6 +40,13 @@ pub fn search(corpus_dir: &Path, query: &str) -> Result<Vec<Hit>, FulltextError>
         .map(|e| e.path())
         .collect();
     files.sort();
+
+    // Filesystem errors take precedence over the `rg` availability check so
+    // a missing corpus dir is reported the same whether or not `rg` is
+    // installed (CI has no devbox, so `rg` is absent there).
+    if !ripgrep_present() {
+        return Err(FulltextError::MissingRipgrep);
+    }
 
     let mut hits = Vec::new();
     for path in &files {
