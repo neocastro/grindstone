@@ -1,0 +1,11 @@
+[package]
+name = "gs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "grindstone CLI"
+
+[dependencies]
+grindstone = { path = "../grindstone" }
+serde = { workspace = true }
+serde_json = { workspace = true }

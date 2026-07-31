@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Corpus / index state (machine-local; regenerable from the manifest)
+/corpus
+/index.sqlite3
+
+# Local tooling state
+/.codewhale/
+
+# IDE
+/.idea
+/.vscode
+*.iml
+
+# OS
+.DS_Store
