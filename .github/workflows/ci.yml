@@ -15,6 +15,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # The full-text baseline tests need `rg`; without it they silently skip.
+      - run: sudo apt-get update && sudo apt-get install -y ripgrep
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
