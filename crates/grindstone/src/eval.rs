@@ -156,10 +156,19 @@ pub fn save_result(path: &Path, result: &EvalResult) -> Result<(), EvalError> {
     std::fs::write(path, text).map_err(EvalError::Io)
 }
 
-/// Full-text strategy adapter: search `corpus_dir` and map hits to doc ids
-/// (file stem, e.g. `rust-book.html` → `rust-book`).
-pub fn fulltext_doc_ids(corpus_dir: &Path, query: &str) -> Result<Vec<String>, EvalError> {
-    let hits = crate::fulltext::search(corpus_dir, query).map_err(EvalError::Fulltext)?;
+/// Full-text strategy adapter: run `searcher` over `corpus_dir` and map hits
+/// to doc ids (file stem, e.g. `rust-book.html` → `rust-book`).
+///
+/// Any [`crate::fulltext::Searcher`] is accepted, so the baseline can be
+/// scored offline via the in-process adapter when `rg` is absent.
+pub fn fulltext_doc_ids(
+    searcher: &dyn crate::fulltext::Searcher,
+    corpus_dir: &Path,
+    query: &str,
+) -> Result<Vec<String>, EvalError> {
+    let hits = searcher
+        .search(corpus_dir, query)
+        .map_err(EvalError::Fulltext)?;
     Ok(hits
         .into_iter()
         .map(|h| {
@@ -385,22 +394,10 @@ mod tests {
         assert_eq!(back, result);
     }
 
-    // --- integration test against the real fulltext baseline (needs rg) ---
-
-    fn ripgrep_present() -> bool {
-        std::process::Command::new("rg")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
+    // --- integration test against the fulltext baseline (any searcher) ---
 
     #[test]
     fn fulltext_eval_on_tiny_corpus() {
-        if !ripgrep_present() {
-            eprintln!("skipping: rg not installed");
-            return;
-        }
         let dir = std::env::temp_dir().join(format!("gs-eval-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -420,7 +417,10 @@ mod tests {
                 expected: vec!["rust-book".into()],
             }],
         };
-        let mut strategy = |q: &str| fulltext_doc_ids(&dir, q);
+        // The eval harness must accept any searcher; the in-process adapter
+        // keeps this baseline test running even when `rg` is absent (CI).
+        let searcher = crate::fulltext::InProcessSearcher;
+        let mut strategy = |q: &str| fulltext_doc_ids(&searcher, &dir, q);
         let result = run_eval("fulltext", &mut strategy, &set).unwrap();
         assert_eq!(result.queries[0].hits, vec!["rust-book".to_string()]);
         assert_eq!(result.queries[0].recall_5, 1.0);
