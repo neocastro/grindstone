@@ -98,6 +98,14 @@ pub fn load_index(
     Ok((store, bm25))
 }
 
+/// Load just the vector store — the cosine-only consumer path (no sparse
+/// BM25 index built, since pure cosine never needs it). Consumers of dense
+/// retrieval through [`load_index`] get both; the per-stage CLI stays a
+/// thin shell either way.
+pub fn load_vector_store(index_dir: &Path) -> Result<crate::vector::VectorStore, IndexBuildError> {
+    crate::vector::VectorStore::load(index_dir).map_err(IndexBuildError::Vector)
+}
+
 /// Summary of one full index build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexBuildReport {
@@ -359,6 +367,25 @@ mod tests {
             5,
             None,
         );
+        assert!(!hits.is_empty());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_vector_store_returns_store_without_sparse_index() {
+        let dir = std::env::temp_dir().join(format!("gs-ib-lvs-{}", std::process::id()));
+        let index = dir.join("index");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_fixture_corpus(&dir);
+
+        let mut call = fake_embedder();
+        let report = build_index(&dir, &index, call.as_mut(), None, None).unwrap();
+
+        // The cosine-only load path: same store, no sparse index built.
+        let store = load_vector_store(&index).unwrap();
+        assert_eq!(store.len(), report.chunks);
+        let hits = store.search(&[1.0, 1.0, 1.0], 5, None);
         assert!(!hits.is_empty());
 
         std::fs::remove_dir_all(&dir).unwrap();
