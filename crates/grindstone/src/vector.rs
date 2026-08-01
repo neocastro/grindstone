@@ -90,6 +90,11 @@ impl VectorStore {
         })
     }
 
+    /// Look up a chunk by id (used by hybrid fusion to resolve hits).
+    pub fn chunk(&self, id: &str) -> Option<&Chunk> {
+        self.chunks.get(id)
+    }
+
     /// Number of chunks in the store.
     pub fn len(&self) -> usize {
         self.chunks.len()
@@ -309,6 +314,19 @@ mod tests {
         assert!(!store.is_empty());
         assert_eq!(store.dim, 2);
         assert_eq!(store.model, "fake-model");
+    }
+
+    #[test]
+    fn chunk_accessor_resolves_ids() {
+        let dir = TempDir::new("accessor");
+        let chunks = vec![chunk("a", "rust-book", PinnedSource, "text a")];
+        write_artifacts(&dir, &chunks, &[("a", vec![1.0, 0.0])], 2);
+        let store = VectorStore::load(dir.path()).unwrap();
+        assert_eq!(
+            store.chunk("a").map(|c| c.source.as_str()),
+            Some("rust-book")
+        );
+        assert!(store.chunk("nope").is_none());
     }
 
     #[test]

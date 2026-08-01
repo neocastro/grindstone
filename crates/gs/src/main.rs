@@ -1,7 +1,8 @@
 //! gs — grindstone CLI.
 
 use grindstone::{
-    build_prompt, build_prompt_with_context, chunk, embed, eval, fulltext, ingest, manifest,
+    bm25, build_prompt, build_prompt_with_context, chunk, embed, eval, fulltext, hybrid, ingest,
+    manifest,
     manifest::{Manifest, SourceFormat, TrustTier},
     retrieve_context,
     vector::{self, VectorStore},
@@ -16,6 +17,7 @@ const DEFAULT_EVAL_SET: &str = "eval/evalset.json";
 const DEFAULT_INDEX_DIR: &str = "index";
 const BASELINE_RESULT: &str = "eval/results/fulltext-baseline.json";
 const COSINE_RESULT: &str = "eval/results/cosine.json";
+const HYBRID_RESULT: &str = "eval/results/hybrid.json";
 
 /// A retrieval strategy for the eval harness: query → ranked doc ids.
 type EvalStrategy = Box<dyn FnMut(&str) -> Result<Vec<String>, eval::EvalError>>;
@@ -56,8 +58,8 @@ fn usage() {
     eprintln!("usage: gs build-prompt [REPO] [--no-rag] [--index DIR] [--ollama URL]");
     eprintln!("             (issue JSON on stdin; retrieves corpus context by default)");
     eprintln!("       gs ingest [CORPUS_DIR]   (default: corpus)");
-    eprintln!("       gs query [--embed] [--tier TIER] QUERY [DIR] [OLLAMA_URL]");
-    eprintln!("             --embed: cosine over INDEX_DIR (default: index); default: fulltext over CORPUS_DIR");
+    eprintln!("       gs query [--embed|--hybrid] [--tier TIER] QUERY [DIR] [OLLAMA_URL]");
+    eprintln!("             --embed: cosine; --hybrid: BM25+cosine fusion; default: fulltext over CORPUS_DIR");
     eprintln!("             --tier: pinned-source|docs-wiki|navigational (cosine only)");
     eprintln!("       gs eval [--strategy fulltext|cosine] [CORPUS_DIR] [EVAL_SET]");
     eprintln!("       gs chunk [CORPUS_DIR] [INDEX_DIR]   (defaults: corpus, index)");
@@ -202,20 +204,26 @@ fn cmd_ingest(mut args: impl Iterator<Item = String>) {
     }
 }
 
-/// `gs query [--embed] [--tier TIER] QUERY [DIR] [OLLAMA_URL]` — two
-/// retrieval strategies behind one flag:
+/// `gs query [--embed|--hybrid] [--tier TIER] QUERY [DIR] [OLLAMA_URL]` —
+/// three retrieval strategies behind one flag:
 /// - default: full-text `rg` over the corpus (the deliberately-dumb baseline,
 ///   fully offline, ranked by match count with an evidence snippet);
 /// - `--embed`: embed the query via local Ollama and rank chunks by cosine
-///   similarity through the vector store, with provenance metadata per hit
-///   and an optional trust-tier filter.
+///   similarity through the vector store;
+/// - `--hybrid`: fuse BM25 (sparse) + cosine (dense) via reciprocal-rank
+///   fusion.
+/// 
+/// Both dense modes print top-k hits with score + provenance metadata and an
+/// optional trust-tier filter.
 fn cmd_query(mut args: impl Iterator<Item = String>) {
     let mut embed_mode = false;
+    let mut hybrid_mode = false;
     let mut tier: Option<TrustTier> = None;
     let mut positional: Vec<String> = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--embed" => embed_mode = true,
+            "--hybrid" => hybrid_mode = true,
             "--tier" => {
                 let value = args.next().unwrap_or_else(|| {
                     eprintln!("gs query: --tier requires a value");
@@ -247,7 +255,7 @@ fn cmd_query(mut args: impl Iterator<Item = String>) {
         }
     };
 
-    if embed_mode {
+    if embed_mode || hybrid_mode {
         let index_dir = PathBuf::from(
             positional
                 .get(1)
@@ -258,12 +266,12 @@ fn cmd_query(mut args: impl Iterator<Item = String>) {
             .get(2)
             .cloned()
             .unwrap_or_else(|| embed::DEFAULT_OLLAMA_URL.to_string());
-        cmd_query_cosine(&query, &index_dir, &server_url, tier);
+        cmd_query_dense(&query, &index_dir, &server_url, tier, hybrid_mode);
         return;
     }
 
     if tier.is_some() {
-        eprintln!("gs query: --tier only applies with --embed");
+        eprintln!("gs query: --tier only applies with --embed or --hybrid");
         std::process::exit(2);
     }
     let corpus_dir = PathBuf::from(
@@ -292,9 +300,16 @@ fn cmd_query(mut args: impl Iterator<Item = String>) {
     }
 }
 
-/// The cosine query path: load the vector store, embed the query, rank, and
-/// print top-k hits with score + provenance metadata.
-fn cmd_query_cosine(query: &str, index_dir: &Path, server_url: &str, tier: Option<TrustTier>) {
+/// The dense query path: load the vector store, embed the query, rank
+/// (cosine, or BM25+cosine fusion when `hybrid`), and print top-k hits with
+/// score + provenance metadata.
+fn cmd_query_dense(
+    query: &str,
+    index_dir: &Path,
+    server_url: &str,
+    tier: Option<TrustTier>,
+    hybrid: bool,
+) {
     let store = match VectorStore::load(index_dir) {
         Ok(s) => s,
         Err(e) => {
@@ -311,7 +326,27 @@ fn cmd_query_cosine(query: &str, index_dir: &Path, server_url: &str, tier: Optio
             std::process::exit(1);
         }
     };
-    let hits = store.search(&vectors[0], vector::DEFAULT_TOP_K, tier);
+    let hits = if hybrid {
+        let chunks_path = index_dir.join("chunks.json");
+        let chunks = match chunk::ChunksFile::load(&chunks_path) {
+            Ok(f) => f.chunks,
+            Err(e) => {
+                eprintln!("gs query: cannot load {}: {e}", chunks_path.display());
+                std::process::exit(1);
+            }
+        };
+        let index = bm25::Bm25Index::build(&chunks);
+        hybrid::hybrid_search(
+            &store,
+            &index,
+            &vectors[0],
+            query,
+            vector::DEFAULT_TOP_K,
+            tier,
+        )
+    } else {
+        store.search(&vectors[0], vector::DEFAULT_TOP_K, tier)
+    };
     if hits.is_empty() {
         println!(
             "no hits for {query:?} (store: {} chunks, dim {}, model {})",
@@ -456,8 +491,43 @@ fn cmd_eval(mut args: impl Iterator<Item = String>) {
                 }),
             )
         }
+        "hybrid" => {
+            let index_dir = PathBuf::from(DEFAULT_INDEX_DIR);
+            let store = match VectorStore::load(&index_dir) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("gs eval: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let chunks_path = index_dir.join("chunks.json");
+            let chunks = match chunk::ChunksFile::load(&chunks_path) {
+                Ok(f) => f.chunks,
+                Err(e) => {
+                    eprintln!("gs eval: cannot load {}: {e}", chunks_path.display());
+                    std::process::exit(1);
+                }
+            };
+            let index = bm25::Bm25Index::build(&chunks);
+            let server_url = embed::DEFAULT_OLLAMA_URL.to_string();
+            (
+                PathBuf::from(HYBRID_RESULT),
+                Box::new(move |query: &str| {
+                    let call = |inputs: &[String]| {
+                        embed::ollama_embed(&server_url, embed::DEFAULT_EMBED_MODEL, inputs)
+                    };
+                    let vectors = call(&[query.to_string()]).map_err(eval::EvalError::Embed)?;
+                    let q = vectors.first().ok_or_else(|| {
+                        eval::EvalError::Embed(embed::EmbedError::Http(
+                            "embedder returned no vectors".into(),
+                        ))
+                    })?;
+                    Ok(eval::hybrid_doc_ids(&store, &index, query, q))
+                }),
+            )
+        }
         other => {
-            eprintln!("gs eval: unknown strategy {other:?} (fulltext|cosine)");
+            eprintln!("gs eval: unknown strategy {other:?} (fulltext|cosine|hybrid)");
             std::process::exit(2);
         }
     };
@@ -505,6 +575,21 @@ fn cmd_eval(mut args: impl Iterator<Item = String>) {
                     "gs eval: cannot compare to baseline {}: {e}",
                     BASELINE_RESULT
                 );
+            }
+        }
+    }
+
+    if strategy_name == "hybrid" {
+        match eval::EvalResult::load(Path::new(COSINE_RESULT)) {
+            Ok(cos) => {
+                println!(
+                    "vs cosine baseline: recall@5 {:+.3}  recall@10 {:+.3}",
+                    result.overall_recall_5 - cos.overall_recall_5,
+                    result.overall_recall_10 - cos.overall_recall_10
+                );
+            }
+            Err(e) => {
+                eprintln!("gs eval: cannot compare to cosine {}: {e}", COSINE_RESULT);
             }
         }
     }

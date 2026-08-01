@@ -200,6 +200,33 @@ pub fn cosine_doc_ids(
     Ok(doc_ids)
 }
 
+/// Hybrid strategy adapter: fuse BM25 + cosine for `query` (the embedding is
+/// passed in — the caller owns the embed call), map the top-k fused chunks to
+/// doc ids (deduped source names, rank order preserved).
+pub fn hybrid_doc_ids(
+    store: &crate::vector::VectorStore,
+    bm25: &crate::bm25::Bm25Index,
+    query: &str,
+    query_embedding: &[f32],
+) -> Vec<String> {
+    let hits = crate::hybrid::hybrid_search(
+        store,
+        bm25,
+        query_embedding,
+        query,
+        crate::vector::DEFAULT_TOP_K,
+        None,
+    );
+    let mut seen = std::collections::HashSet::new();
+    let mut doc_ids = Vec::new();
+    for hit in hits {
+        if seen.insert(hit.chunk.source.clone()) {
+            doc_ids.push(hit.chunk.source);
+        }
+    }
+    doc_ids
+}
+
 /// Errors produced by the eval harness.
 #[derive(Debug)]
 pub enum EvalError {
@@ -457,6 +484,25 @@ mod tests {
         // Two rust-book chunks tie (both score 1.0); doc ids dedupe in rank
         // order: rust-book first (two chunks), then clippy.
         assert_eq!(ids, vec!["rust-book".to_string(), "clippy".to_string()]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hybrid_doc_ids_promotes_lexical_match_to_first() {
+        let dir = std::env::temp_dir().join(format!("gs-eval-hyb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_tiny_store(&dir); // r1/r2 rust-book "borrow checker", c1 clippy "restriction lints"
+        let store = crate::vector::VectorStore::load(&dir).unwrap();
+        let chunks_file = crate::chunk::ChunksFile::load(&dir.join("chunks.json")).unwrap();
+        let bm25 = crate::bm25::Bm25Index::build(&chunks_file.chunks);
+
+        // Embedding points at rust-book (cosine-first is rust-book), but the
+        // query text "restriction lints" only matches the clippy chunk — the
+        // fusion must promote clippy to the front.
+        let ids = hybrid_doc_ids(&store, &bm25, "restriction lints", &[1.0, 0.0]);
+        assert_eq!(ids, vec!["clippy".to_string(), "rust-book".to_string()]);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
