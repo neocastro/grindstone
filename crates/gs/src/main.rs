@@ -1,7 +1,8 @@
 //! gs — grindstone CLI.
 
 use grindstone::{
-    bm25, build_prompt, build_prompt_with_context, chunk, embed, eval, fulltext, hybrid, ingest,
+    build_prompt, build_prompt_with_context, chunk, embed, eval, fulltext, hybrid, indexbuild,
+    ingest,
     manifest::{Manifest, TrustTier},
     retrieve_context,
     vector::{self, VectorStore},
@@ -306,13 +307,6 @@ fn cmd_query_dense(
     tier: Option<TrustTier>,
     hybrid: bool,
 ) {
-    let store = match VectorStore::load(index_dir) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("gs query: {e}");
-            std::process::exit(1);
-        }
-    };
     let mut call =
         |inputs: &[String]| embed::ollama_embed(server_url, embed::DEFAULT_EMBED_MODEL, inputs);
     let q = match embed::embed_query_vector(&mut call, query) {
@@ -322,19 +316,28 @@ fn cmd_query_dense(
             std::process::exit(1);
         }
     };
-    let hits = if hybrid {
-        let chunks_path = index_dir.join("chunks.json");
-        let chunks = match chunk::ChunksFile::load(&chunks_path) {
-            Ok(f) => f.chunks,
+    let (store, hits) = if hybrid {
+        // Load store + sparse index through the library (RAG-12a): no
+        // hand-rolled chunks reload or BM25 rebuild in the CLI.
+        let (store, index) = match indexbuild::load_index(index_dir) {
+            Ok(pair) => pair,
             Err(e) => {
-                eprintln!("gs query: cannot load {}: {e}", chunks_path.display());
+                eprintln!("gs query: {e}");
                 std::process::exit(1);
             }
         };
-        let index = bm25::Bm25Index::build(&chunks);
-        hybrid::hybrid_search(&store, &index, &q, query, vector::DEFAULT_TOP_K, tier)
+        let hits = hybrid::hybrid_search(&store, &index, &q, query, vector::DEFAULT_TOP_K, tier);
+        (store, hits)
     } else {
-        store.search(&q, vector::DEFAULT_TOP_K, tier)
+        let store = match VectorStore::load(index_dir) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("gs query: {e}");
+                std::process::exit(1);
+            }
+        };
+        let hits = store.search(&q, vector::DEFAULT_TOP_K, tier);
+        (store, hits)
     };
     if hits.is_empty() {
         println!(
@@ -571,31 +574,20 @@ fn cmd_chunk(mut args: impl Iterator<Item = String>) {
     );
     let index_dir = PathBuf::from(args.next().unwrap_or_else(|| DEFAULT_INDEX_DIR.to_string()));
 
-    let manifest_path = corpus_dir.join("manifest.json");
-    let manifest = match Manifest::load(&manifest_path) {
-        Ok(m) => m,
+    // Delegate the manifest → file → chunk walk to the library (RAG-12a);
+    // the per-source line is the only CLI-specific output.
+    let mut on_source = |name: &str, n: usize| println!("{n:>6} chunks  {name}");
+    let file = match indexbuild::chunk_corpus(&corpus_dir, Some(&mut on_source)) {
+        Ok(f) => f,
         Err(e) => {
-            eprintln!("gs chunk: cannot load {}: {e}", manifest_path.display());
-            std::process::exit(2);
+            let code = match &e {
+                indexbuild::IndexBuildError::Manifest(_) => 2,
+                _ => 1,
+            };
+            eprintln!("gs chunk: {e}");
+            std::process::exit(code);
         }
     };
-
-    let mut chunks = Vec::new();
-    for source in &manifest.sources {
-        let path = corpus_dir.join(source.filename());
-        let content = match std::fs::read_to_string(&path) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("gs chunk: cannot read {}: {e}", path.display());
-                std::process::exit(1);
-            }
-        };
-        let doc_chunks = chunk::chunk(&content, source);
-        println!("{:>6} chunks  {}", doc_chunks.len(), source.name);
-        chunks.extend(doc_chunks);
-    }
-
-    let file = chunk::ChunksFile { version: 1, chunks };
     let out = index_dir.join("chunks.json");
     if let Err(e) = file.save(&out) {
         eprintln!("gs chunk: cannot write {}: {e}", out.display());
@@ -646,38 +638,23 @@ fn cmd_embed(mut args: impl Iterator<Item = String>) {
             "gs embed: {done}/{total} chunks ({pct:.1}%) — {rate:.0} chunks/s, ~{remaining}s remaining"
         );
     };
-    // Incremental: reuse existing vectors for unchanged chunks (content-
-    // addressed ids), embed only what changed, prune stale ids.
-    let existing = embed::EmbeddingsFile::load(&index_dir.join("embeddings.json")).ok();
-    let reused = existing
-        .as_ref()
-        .map(|e| {
-            e.vectors
-                .keys()
-                .filter(|id| file.chunks.iter().any(|c| &c.id == *id))
-                .count()
-        })
-        .unwrap_or(0);
+    // The reuse-counting and incremental embed live in the library (RAG-12a);
+    // the CLI only reports the outcome.
+    let (embeddings, reused) =
+        match indexbuild::embed_corpus(&file.chunks, &index_dir, &mut call, Some(&mut on_progress))
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("gs embed: {e}");
+                std::process::exit(1);
+            }
+        };
     if reused > 0 {
         eprintln!(
             "gs embed: reusing {reused} of {} chunk embeddings",
             file.chunks.len()
         );
     }
-    let embeddings = match embed::embed_chunks_incremental(
-        &file.chunks,
-        embed::DEFAULT_EMBED_MODEL,
-        embed::DEFAULT_BATCH_SIZE,
-        &mut call,
-        existing.as_ref(),
-        Some(&mut on_progress),
-    ) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("gs embed: {e}");
-            std::process::exit(1);
-        }
-    };
 
     let out = index_dir.join("embeddings.json");
     if let Err(e) = embeddings.save(&out) {

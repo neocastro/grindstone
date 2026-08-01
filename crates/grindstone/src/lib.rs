@@ -9,6 +9,7 @@ pub mod embed;
 pub mod eval;
 pub mod fulltext;
 pub mod hybrid;
+pub mod indexbuild;
 pub mod ingest;
 pub mod manifest;
 pub mod vector;
