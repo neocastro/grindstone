@@ -114,6 +114,14 @@ pub fn embed_query_vector(embed: &mut Embedder, query: &str) -> Result<Vec<f32>,
         .ok_or_else(|| EmbedError::Http("embedder returned no vectors".into()))
 }
 
+/// The production embedder as a `'static` box: Ollama at
+/// [`DEFAULT_OLLAMA_URL`] with [`DEFAULT_EMBED_MODEL`]. Ownable by library
+/// strategies and CLI commands, so callers never inline an embed call.
+pub fn ollama_embedder() -> Box<Embedder<'static>> {
+    let server_url = DEFAULT_OLLAMA_URL.to_string();
+    Box::new(move |inputs: &[String]| ollama_embed(&server_url, DEFAULT_EMBED_MODEL, inputs))
+}
+
 /// Embed every chunk in order, batched, keyed by chunk id.
 ///
 /// `call` is the injectable embedder. Returns an `EmbeddingsFile` with a

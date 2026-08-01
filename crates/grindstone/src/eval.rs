@@ -239,6 +239,63 @@ pub fn hybrid_doc_ids(
     dedup_doc_ids(hits)
 }
 
+/// Build the full-text eval strategy: `corpus_dir` searched through
+/// `searcher`. `searcher` is the RAG-10 seam, so this runs offline via the
+/// in-process adapter when `rg` is absent (CI).
+///
+/// A strategy constructor: the library owns every eval strategy; the CLI
+/// only looks one up by name (RAG-11b).
+pub fn fulltext_strategy(
+    corpus_dir: &Path,
+    searcher: Box<dyn crate::fulltext::Searcher>,
+) -> Result<Box<Strategy<'static>>, EvalError> {
+    let corpus_dir = corpus_dir.to_path_buf();
+    Ok(Box::new(move |query: &str| {
+        fulltext_doc_ids(searcher.as_ref(), &corpus_dir, query)
+    }))
+}
+
+/// Build the cosine eval strategy: the vector store under `index_dir` plus an
+/// owned embedder. Loading the store here (not in the caller) keeps the
+/// library the single owner of strategy construction.
+pub fn cosine_strategy(
+    index_dir: &Path,
+    mut embed: Box<crate::embed::Embedder<'static>>,
+) -> Result<Box<Strategy<'static>>, EvalError> {
+    let store = crate::vector::VectorStore::load(index_dir).map_err(|e| EvalError::Load {
+        what: index_dir.display().to_string(),
+        detail: e.to_string(),
+    })?;
+    Ok(Box::new(move |query: &str| {
+        cosine_doc_ids(&store, embed.as_mut(), query)
+    }))
+}
+
+/// Build the hybrid eval strategy: vector store + BM25 index under
+/// `index_dir`, plus an owned embedder. Loading both artifacts here keeps the
+/// library the single owner of strategy construction.
+pub fn hybrid_strategy(
+    index_dir: &Path,
+    mut embed: Box<crate::embed::Embedder<'static>>,
+) -> Result<Box<Strategy<'static>>, EvalError> {
+    let store = crate::vector::VectorStore::load(index_dir).map_err(|e| EvalError::Load {
+        what: index_dir.display().to_string(),
+        detail: e.to_string(),
+    })?;
+    let chunks = crate::chunk::ChunksFile::load(&index_dir.join("chunks.json"))
+        .map_err(|e| EvalError::Load {
+            what: index_dir.join("chunks.json").display().to_string(),
+            detail: e.to_string(),
+        })?
+        .chunks;
+    let index = crate::bm25::Bm25Index::build(&chunks);
+    Ok(Box::new(move |query: &str| {
+        let q =
+            crate::embed::embed_query_vector(embed.as_mut(), query).map_err(EvalError::Embed)?;
+        Ok(hybrid_doc_ids(&store, &index, query, &q))
+    }))
+}
+
 /// Errors produced by the eval harness.
 #[derive(Debug)]
 pub enum EvalError {
@@ -246,6 +303,11 @@ pub enum EvalError {
     Json(serde_json::Error),
     Fulltext(crate::fulltext::FulltextError),
     Embed(crate::embed::EmbedError),
+    /// Loading an index artifact (vector store, chunks) failed.
+    Load {
+        what: String,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for EvalError {
@@ -255,6 +317,7 @@ impl std::fmt::Display for EvalError {
             EvalError::Json(e) => write!(f, "eval JSON error: {e}"),
             EvalError::Fulltext(e) => write!(f, "fulltext error: {e}"),
             EvalError::Embed(e) => write!(f, "embed error: {e}"),
+            EvalError::Load { what, detail } => write!(f, "cannot load {what}: {detail}"),
         }
     }
 }
@@ -547,5 +610,77 @@ mod tests {
         assert!(matches!(err, EvalError::Embed(_)));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- strategy constructors (RAG-11b): the library owns the strategies ---
+
+    /// A fake embedder, boxed as an owned `'static` embedder (as the
+    /// strategy constructors take).
+    fn fake_embedder() -> Box<crate::embed::Embedder<'static>> {
+        Box::new(
+            |_: &[String]| -> Result<Vec<Vec<f32>>, crate::embed::EmbedError> {
+                Ok(vec![vec![1.0, 0.0]])
+            },
+        )
+    }
+
+    #[test]
+    fn fulltext_strategy_queries_via_searcher_seam() {
+        let dir = std::env::temp_dir().join(format!("gs-eval-strat-ft-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("rust-book.html"),
+            b"<html><body>The borrow checker is the core of ownership.</body></html>\n",
+        )
+        .unwrap();
+
+        // In-process searcher: the strategy runs without rg (CI).
+        let mut strategy =
+            fulltext_strategy(&dir, Box::new(crate::fulltext::InProcessSearcher)).unwrap();
+        let ids = strategy("borrow checker").unwrap();
+        assert_eq!(ids, vec!["rust-book".to_string()]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cosine_strategy_loads_store_and_queries() {
+        let dir = std::env::temp_dir().join(format!("gs-eval-strat-cos-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_tiny_store(&dir);
+
+        let mut strategy = cosine_strategy(&dir, fake_embedder()).unwrap();
+        let ids = strategy("borrow checker").unwrap();
+        assert_eq!(ids, vec!["rust-book".to_string(), "clippy".to_string()]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hybrid_strategy_loads_store_and_index_and_queries() {
+        let dir = std::env::temp_dir().join(format!("gs-eval-strat-hyb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_tiny_store(&dir);
+
+        let mut strategy = hybrid_strategy(&dir, fake_embedder()).unwrap();
+        let ids = strategy("restriction lints").unwrap();
+        assert_eq!(ids, vec!["clippy".to_string(), "rust-book".to_string()]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn strategy_constructors_report_load_errors() {
+        assert!(matches!(
+            cosine_strategy(Path::new("/nonexistent"), fake_embedder()),
+            Err(EvalError::Load { .. })
+        ));
+        assert!(matches!(
+            hybrid_strategy(Path::new("/nonexistent"), fake_embedder()),
+            Err(EvalError::Load { .. })
+        ));
     }
 }

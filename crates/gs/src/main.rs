@@ -18,9 +18,6 @@ const BASELINE_RESULT: &str = "eval/results/fulltext-baseline.json";
 const COSINE_RESULT: &str = "eval/results/cosine.json";
 const HYBRID_RESULT: &str = "eval/results/hybrid.json";
 
-/// A retrieval strategy for the eval harness: query → ranked doc ids.
-type EvalStrategy = Box<dyn FnMut(&str) -> Result<Vec<String>, eval::EvalError>>;
-
 fn main() {
     let mut args = std::env::args().skip(1);
     let sub = args.next();
@@ -394,6 +391,20 @@ fn snippet(text: &str, max: usize) -> String {
 /// the same eval set. `fulltext` is the offline baseline; `cosine` embeds
 /// each query via local Ollama and retrieves through the vector store, then
 /// prints the delta against the persisted fulltext baseline.
+/// Unwrap a strategy constructor result — the CLI's one error surface for
+/// strategy construction (exit 1 with the library's message).
+fn build(
+    strategy: Result<Box<eval::Strategy<'static>>, eval::EvalError>,
+) -> Box<eval::Strategy<'static>> {
+    match strategy {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("gs eval: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn cmd_eval(mut args: impl Iterator<Item = String>) {
     let mut strategy_name = "fulltext".to_string();
     let mut positional: Vec<String> = Vec::new();
@@ -453,74 +464,38 @@ fn cmd_eval(mut args: impl Iterator<Item = String>) {
         }
     }
 
-    let (result_path, mut strategy): (PathBuf, EvalStrategy) = match strategy_name.as_str() {
-        "fulltext" => {
-            // Preferred adapter (rg) when present; the in-process scan is a
-            // production fallback, so the baseline runs even without rg (CI).
-            let searcher = fulltext::default_searcher();
-            (
+    // Name → strategy lookup (RAG-11b): every strategy is a library
+    // constructor; the CLI only picks a name. Fulltext uses the RAG-10
+    // searcher seam (works offline without rg), and the embedder is the one
+    // production injection point — both owned by the strategy.
+    let (result_path, mut strategy): (PathBuf, Box<eval::Strategy<'static>>) =
+        match strategy_name.as_str() {
+            "fulltext" => (
                 PathBuf::from(BASELINE_RESULT),
-                Box::new(move |query: &str| {
-                    eval::fulltext_doc_ids(searcher.as_ref(), &corpus_dir, query)
-                }),
-            )
-        }
-        "cosine" => {
-            let index_dir = PathBuf::from(DEFAULT_INDEX_DIR);
-            let store = match VectorStore::load(&index_dir) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("gs eval: {e}");
-                    std::process::exit(1);
-                }
-            };
-            let server_url = embed::DEFAULT_OLLAMA_URL.to_string();
-            (
+                build(eval::fulltext_strategy(
+                    &corpus_dir,
+                    fulltext::default_searcher(),
+                )),
+            ),
+            "cosine" => (
                 PathBuf::from(COSINE_RESULT),
-                Box::new(move |query: &str| {
-                    let mut call = |inputs: &[String]| {
-                        embed::ollama_embed(&server_url, embed::DEFAULT_EMBED_MODEL, inputs)
-                    };
-                    eval::cosine_doc_ids(&store, &mut call, query)
-                }),
-            )
-        }
-        "hybrid" => {
-            let index_dir = PathBuf::from(DEFAULT_INDEX_DIR);
-            let store = match VectorStore::load(&index_dir) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("gs eval: {e}");
-                    std::process::exit(1);
-                }
-            };
-            let chunks_path = index_dir.join("chunks.json");
-            let chunks = match chunk::ChunksFile::load(&chunks_path) {
-                Ok(f) => f.chunks,
-                Err(e) => {
-                    eprintln!("gs eval: cannot load {}: {e}", chunks_path.display());
-                    std::process::exit(1);
-                }
-            };
-            let index = bm25::Bm25Index::build(&chunks);
-            let server_url = embed::DEFAULT_OLLAMA_URL.to_string();
-            (
+                build(eval::cosine_strategy(
+                    Path::new(DEFAULT_INDEX_DIR),
+                    embed::ollama_embedder(),
+                )),
+            ),
+            "hybrid" => (
                 PathBuf::from(HYBRID_RESULT),
-                Box::new(move |query: &str| {
-                    let mut call = |inputs: &[String]| {
-                        embed::ollama_embed(&server_url, embed::DEFAULT_EMBED_MODEL, inputs)
-                    };
-                    let q = embed::embed_query_vector(&mut call, query)
-                        .map_err(eval::EvalError::Embed)?;
-                    Ok(eval::hybrid_doc_ids(&store, &index, query, &q))
-                }),
-            )
-        }
-        other => {
-            eprintln!("gs eval: unknown strategy {other:?} (fulltext|cosine|hybrid)");
-            std::process::exit(2);
-        }
-    };
+                build(eval::hybrid_strategy(
+                    Path::new(DEFAULT_INDEX_DIR),
+                    embed::ollama_embedder(),
+                )),
+            ),
+            other => {
+                eprintln!("gs eval: unknown strategy {other:?} (fulltext|cosine|hybrid)");
+                std::process::exit(2);
+            }
+        };
 
     // The harness owns its result: it computes corpus_hash from the manifest
     // (RAG-11a), so the CLI has nothing to patch back.
