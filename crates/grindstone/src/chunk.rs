@@ -1,12 +1,14 @@
-//! Deterministic heading-aware chunker (RAG-3).
+//! Deterministic heading-aware chunker (RAG-3; unified core in RAG-9).
 //!
-//! Turns a corpus HTML document into chunks: structural sections split at
-//! headings, merged into ~500-token units with overlap. Determinism is the
+//! Turns a corpus document (HTML or text) into chunks: structural sections
+//! split at headings (HTML) or FILE markers (text), merged into ~500-token
+//! units with overlap. Both formats feed one shared section-merge core via
+//! [`chunk`], which owns the `SourceFormat` dispatch. Determinism is the
 //! contract: same input → identical chunk ids and text, bit-for-bit. Chunk
 //! ids are content-addressed (sha256 of the chunk text), so an unchanged
 //! chunk keeps its id across runs even if neighbouring chunks shift.
 
-use crate::manifest::{sha256_hex, Source, TrustTier};
+use crate::manifest::{sha256_hex, Source, SourceFormat, TrustTier};
 use serde::{Deserialize, Serialize};
 
 /// Target chunk size in (estimated) tokens.
@@ -84,13 +86,23 @@ pub fn sections_from_html(html: &str) -> Vec<Section> {
                     .map(|i| close_start + i + 1)
                     .unwrap_or(rest.len());
                 let heading_text = strip_tags(&rest[open_end..close_start]).trim().to_string();
-                flush_section(&mut sections, &mut current_heading, &mut current_text);
+                flush_section(
+                    &mut sections,
+                    &mut current_heading,
+                    &mut current_text,
+                    TextNormalization::Collapse,
+                );
                 current_heading = heading_text;
                 rest = &rest[close_end..];
             }
         }
     }
-    flush_section(&mut sections, &mut current_heading, &mut current_text);
+    flush_section(
+        &mut sections,
+        &mut current_heading,
+        &mut current_text,
+        TextNormalization::Collapse,
+    );
     sections
 }
 
@@ -107,17 +119,41 @@ fn find_heading_tag(s: &str) -> Option<usize> {
     None
 }
 
-fn flush_section(sections: &mut Vec<Section>, heading: &mut String, text: &mut String) {
-    // Take ownership FIRST so the caller's buffer is cleared: the pushed
-    // section is a collapsed copy of the accumulated text, and the buffer
-    // must not leak into the next section.
+/// How a producer's accumulated text is normalized before becoming a section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextNormalization {
+    /// Collapse runs of whitespace into single spaces (HTML prose).
+    Collapse,
+    /// Preserve the text byte-for-byte (source code, where indentation and
+    /// blank lines are significant).
+    Preserve,
+}
+
+/// Push the accumulated text as a section unless it is empty.
+///
+/// The single flush shared by every format producer: takes ownership FIRST
+/// so the caller's buffer is cleared and nothing leaks into the next
+/// section, then pushes a section with the producer's normalization applied.
+/// A section with no text and no heading is skipped (the heading is cleared
+/// so it cannot leak either).
+fn flush_section(
+    sections: &mut Vec<Section>,
+    heading: &mut String,
+    text: &mut String,
+    normalize: TextNormalization,
+) {
     let raw = std::mem::take(text);
-    let collapsed = collapse_whitespace(&raw);
-    if !collapsed.is_empty() || !heading.is_empty() {
+    let normalized = match normalize {
+        TextNormalization::Collapse => collapse_whitespace(&raw),
+        TextNormalization::Preserve => raw,
+    };
+    if !normalized.trim().is_empty() || !heading.is_empty() {
         sections.push(Section {
             heading: std::mem::take(heading),
-            text: collapsed,
+            text: normalized,
         });
+    } else {
+        heading.clear();
     }
 }
 
@@ -170,7 +206,12 @@ pub fn sections_from_text(text: &str) -> Vec<Section> {
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix(FILE_MARKER) {
             if let Some(path) = rest.strip_suffix(" =====") {
-                flush_text_section(&mut sections, &mut current_heading, &mut current_text);
+                flush_section(
+                    &mut sections,
+                    &mut current_heading,
+                    &mut current_text,
+                    TextNormalization::Preserve,
+                );
                 current_heading = path.trim().to_string();
                 continue;
             }
@@ -178,23 +219,13 @@ pub fn sections_from_text(text: &str) -> Vec<Section> {
         current_text.push_str(line);
         current_text.push('\n');
     }
-    flush_text_section(&mut sections, &mut current_heading, &mut current_text);
+    flush_section(
+        &mut sections,
+        &mut current_heading,
+        &mut current_text,
+        TextNormalization::Preserve,
+    );
     sections
-}
-
-/// Push the accumulated text section unless it is empty (mirrors
-/// `flush_section`, but preserves code whitespace — collapsing runs of
-/// whitespace would destroy indentation in source files).
-fn flush_text_section(sections: &mut Vec<Section>, heading: &mut String, text: &mut String) {
-    let raw = std::mem::take(text);
-    if !raw.trim().is_empty() || !heading.is_empty() {
-        sections.push(Section {
-            heading: std::mem::take(heading),
-            text: raw,
-        });
-    } else {
-        heading.clear();
-    }
 }
 
 /// Chunk a text corpus document (see `sections_from_text`) with the source's
@@ -203,8 +234,23 @@ pub fn chunk_text(text: &str, source: &Source) -> Vec<Chunk> {
     chunk_sections(&sections_from_text(text), source)
 }
 
+/// Chunk an HTML corpus document (see `sections_from_html`) with the source's
+/// provenance metadata. Deterministic: same html + source → identical chunks.
 pub fn chunk_source(html: &str, source: &Source) -> Vec<Chunk> {
     chunk_sections(&sections_from_html(html), source)
+}
+
+/// Chunk a corpus document according to its manifest source format.
+///
+/// The single dispatch entry for the chunker: HTML documents are chunked by
+/// heading, text documents by FILE marker, and both feed the same
+/// section-merge core. Deterministic: same content + source → identical
+/// chunks, bit-for-bit.
+pub fn chunk(content: &str, source: &Source) -> Vec<Chunk> {
+    match source.format {
+        SourceFormat::Html => chunk_source(content, source),
+        SourceFormat::Text => chunk_text(content, source),
+    }
 }
 
 /// Merge and split `sections` into ~500-token chunks with overlap; every
@@ -573,6 +619,53 @@ mod tests {
             "duplicate content must not produce duplicate chunk ids"
         );
         assert!(chunks.iter().any(|c| c.heading == "PlusCal.tla"));
+    }
+
+    // --- RAG-9: unified chunking core (one entry, both formats) ---
+
+    #[test]
+    fn chunk_dispatches_html_by_source_format() {
+        let html = "<h1>Ownership</h1><p>The borrow checker is central.</p>";
+        let chunks = chunk(html, &source());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading, "Ownership");
+        assert!(chunks[0].text.contains("borrow checker"));
+    }
+
+    #[test]
+    fn chunk_dispatches_text_by_source_format() {
+        let mut s = source();
+        s.format = SourceFormat::Text;
+        let text = "===== FILE: a/A.java =====\nclass A {}\n";
+        let chunks = chunk(text, &s);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading, "a/A.java");
+        assert!(chunks[0].text.contains("class A {}"));
+    }
+
+    #[test]
+    fn chunk_routes_to_the_format_specific_entries() {
+        // The unified entry must produce exactly the chunks the per-format
+        // producers produced before RAG-9 — same interface, same output.
+        let html = "<h1>Ownership</h1><p>The borrow checker is central.</p>";
+        assert_eq!(chunk(html, &source()), chunk_source(html, &source()));
+
+        let mut s = source();
+        s.format = SourceFormat::Text;
+        let text = "===== FILE: a/A.java =====\nclass A {}\n";
+        assert_eq!(chunk(text, &s), chunk_text(text, &s));
+    }
+
+    #[test]
+    fn chunk_is_deterministic_for_both_formats() {
+        // Same input through the unified entry → identical chunks, bit-for-bit.
+        let html = "<h1>Ownership</h1><p>The borrow checker is central.</p>".repeat(30);
+        assert_eq!(chunk(&html, &source()), chunk(&html, &source()));
+
+        let mut s = source();
+        s.format = SourceFormat::Text;
+        let text = "===== FILE: a.java =====\nAAAA\n===== FILE: b.java =====\nBBBB\n";
+        assert_eq!(chunk(text, &s), chunk(text, &s));
     }
 }
 
