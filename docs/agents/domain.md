@@ -26,7 +26,7 @@ The vector representation of a chunk, produced by `nomic-embed-text` via the
 local Ollama server.
 
 **Vector store**:
-The persisted chunk + embedding + metadata index (sqlite-vec at this scale).
+The persisted chunk + embedding + metadata index (deterministic JSON artifacts + in-memory cosine at this scale — see RAG-4).
 _Avoid_: "database" when referring to the index.
 
 **Retrieval strategy**:
