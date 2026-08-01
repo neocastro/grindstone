@@ -3,6 +3,7 @@
 //! v0 scope: hardened agent-prompt construction. The retrieval pipeline
 //! (ingest, chunk, embed, retrieve, eval) lands via the RAG-1..RAG-8 tickets.
 
+pub mod eval;
 pub mod fulltext;
 pub mod ingest;
 pub mod manifest;
