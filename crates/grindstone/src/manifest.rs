@@ -28,6 +28,25 @@ pub struct Source {
     /// Hex sha256 of the fetched content; `None` until ingested.
     #[serde(default)]
     pub hash: Option<String>,
+    /// Trust tier for retrieval ranking/filtering (defaults to
+    /// `pinned-source`; `docs-wiki` and `navigational` arrive with RAG-6).
+    #[serde(default)]
+    pub tier: TrustTier,
+}
+
+/// Provenance rank for retrieval: `pinned-source > docs-wiki > navigational`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TrustTier {
+    /// Pinned, hash-verified upstream content (the manifest's own sources).
+    #[default]
+    #[serde(rename = "pinned-source")]
+    PinnedSource,
+    /// Community wiki docs (e.g. docs.tlapl.us), below pinned source.
+    #[serde(rename = "docs-wiki")]
+    DocsWiki,
+    /// Navigational prose only, never ground truth (e.g. DeepWiki).
+    #[serde(rename = "navigational")]
+    Navigational,
 }
 
 impl Source {
@@ -86,6 +105,7 @@ mod tests {
             license: "MIT OR Apache-2.0".into(),
             url: "https://doc.rust-lang.org/1.95.0/book/print.html".into(),
             hash: None,
+            tier: TrustTier::PinnedSource,
         }
     }
 

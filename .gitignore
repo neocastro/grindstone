@@ -6,6 +6,7 @@
 # reproducibility pin); the downloaded html files are regenerable state.
 /corpus/*.html
 /index.sqlite3
+/index/
 
 # Eval results: derived state; the eval set itself (eval/evalset.json) IS
 # committed — it is the reproducibility pin for retrieval scores.

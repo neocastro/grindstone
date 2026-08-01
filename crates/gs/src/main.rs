@@ -1,12 +1,15 @@
 //! gs — grindstone CLI.
 
-use grindstone::{build_prompt, eval, fulltext, ingest, manifest, manifest::Manifest, Issue};
+use grindstone::{
+    build_prompt, chunk, embed, eval, fulltext, ingest, manifest, manifest::Manifest, Issue,
+};
 use std::io::Read;
 use std::path::PathBuf;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CORPUS_DIR: &str = "corpus";
 const DEFAULT_EVAL_SET: &str = "eval/evalset.json";
+const DEFAULT_INDEX_DIR: &str = "index";
 const BASELINE_RESULT: &str = "eval/results/fulltext-baseline.json";
 
 fn main() {
@@ -26,6 +29,8 @@ fn main() {
         Some("ingest") => cmd_ingest(args),
         Some("query") => cmd_query(args),
         Some("eval") => cmd_eval(args),
+        Some("chunk") => cmd_chunk(args),
+        Some("embed") => cmd_embed(args),
         Some("-h" | "--help") => usage(),
         Some(other) => {
             eprintln!("gs: unknown subcommand `{other}`");
@@ -44,6 +49,10 @@ fn usage() {
     eprintln!("       gs ingest [CORPUS_DIR]   (default: corpus)");
     eprintln!("       gs query QUERY [CORPUS_DIR]   (default: corpus)");
     eprintln!("       gs eval [CORPUS_DIR] [EVAL_SET]   (defaults: corpus, eval/evalset.json)");
+    eprintln!("       gs chunk [CORPUS_DIR] [INDEX_DIR]   (defaults: corpus, index)");
+    eprintln!(
+        "       gs embed [INDEX_DIR] [OLLAMA_URL]   (defaults: index, http://127.0.0.1:11434)"
+    );
     eprintln!("       gs --version");
 }
 
@@ -218,4 +227,94 @@ fn cmd_eval(mut args: impl Iterator<Item = String>) {
             std::process::exit(1);
         }
     }
+}
+
+/// `gs chunk [CORPUS_DIR] [INDEX_DIR]` — chunk every corpus document into
+/// deterministic heading-aware chunks and persist to `INDEX_DIR/chunks.json`.
+/// Same manifest + corpus → identical chunks (bit-for-bit reproducible).
+fn cmd_chunk(mut args: impl Iterator<Item = String>) {
+    let corpus_dir = PathBuf::from(
+        args.next()
+            .unwrap_or_else(|| DEFAULT_CORPUS_DIR.to_string()),
+    );
+    let index_dir = PathBuf::from(args.next().unwrap_or_else(|| DEFAULT_INDEX_DIR.to_string()));
+
+    let manifest_path = corpus_dir.join("manifest.json");
+    let manifest = match Manifest::load(&manifest_path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("gs chunk: cannot load {}: {e}", manifest_path.display());
+            std::process::exit(2);
+        }
+    };
+
+    let mut chunks = Vec::new();
+    for source in &manifest.sources {
+        let path = corpus_dir.join(source.filename());
+        let html = match std::fs::read_to_string(&path) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("gs chunk: cannot read {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        };
+        let doc_chunks = chunk::chunk_source(&html, source);
+        println!("{:>6} chunks  {}", doc_chunks.len(), source.name);
+        chunks.extend(doc_chunks);
+    }
+
+    let file = chunk::ChunksFile { version: 1, chunks };
+    let out = index_dir.join("chunks.json");
+    if let Err(e) = file.save(&out) {
+        eprintln!("gs chunk: cannot write {}: {e}", out.display());
+        std::process::exit(1);
+    }
+    println!("wrote {} ({} chunks)", out.display(), file.chunks.len());
+}
+
+/// `gs embed [INDEX_DIR] [OLLAMA_URL]` — embed every chunk via local Ollama
+/// `nomic-embed-text` and persist to `INDEX_DIR/embeddings.json` for the
+/// vector store (RAG-4) to consume. Fails with a clear error when Ollama is
+/// down; never hangs (hard timeout).
+fn cmd_embed(mut args: impl Iterator<Item = String>) {
+    let index_dir = PathBuf::from(args.next().unwrap_or_else(|| DEFAULT_INDEX_DIR.to_string()));
+    let server_url = args
+        .next()
+        .unwrap_or_else(|| embed::DEFAULT_OLLAMA_URL.to_string());
+
+    let chunks_path = index_dir.join("chunks.json");
+    let file = match chunk::ChunksFile::load(&chunks_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("gs embed: cannot load {}: {e}", chunks_path.display());
+            std::process::exit(2);
+        }
+    };
+
+    let mut call =
+        |inputs: &[String]| embed::ollama_embed(&server_url, embed::DEFAULT_EMBED_MODEL, inputs);
+    let embeddings = match embed::embed_chunks(
+        &file.chunks,
+        embed::DEFAULT_EMBED_MODEL,
+        embed::DEFAULT_BATCH_SIZE,
+        &mut call,
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("gs embed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let out = index_dir.join("embeddings.json");
+    if let Err(e) = embeddings.save(&out) {
+        eprintln!("gs embed: cannot write {}: {e}", out.display());
+        std::process::exit(1);
+    }
+    println!(
+        "wrote {} ({} vectors, dim {})",
+        out.display(),
+        embeddings.vectors.len(),
+        embeddings.dim
+    );
 }
