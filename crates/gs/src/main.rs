@@ -212,7 +212,7 @@ fn cmd_ingest(mut args: impl Iterator<Item = String>) {
 ///   similarity through the vector store;
 /// - `--hybrid`: fuse BM25 (sparse) + cosine (dense) via reciprocal-rank
 ///   fusion.
-/// 
+///
 /// Both dense modes print top-k hits with score + provenance metadata and an
 /// optional trust-tier filter.
 fn cmd_query(mut args: impl Iterator<Item = String>) {
