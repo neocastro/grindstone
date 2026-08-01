@@ -1,16 +1,23 @@
 //! gs — grindstone CLI.
 
 use grindstone::{
-    build_prompt, chunk, embed, eval, fulltext, ingest, manifest, manifest::Manifest, Issue,
+    build_prompt, chunk, embed, eval, fulltext, ingest, manifest,
+    manifest::{Manifest, TrustTier},
+    vector::{self, VectorStore},
+    Issue,
 };
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CORPUS_DIR: &str = "corpus";
 const DEFAULT_EVAL_SET: &str = "eval/evalset.json";
 const DEFAULT_INDEX_DIR: &str = "index";
 const BASELINE_RESULT: &str = "eval/results/fulltext-baseline.json";
+const COSINE_RESULT: &str = "eval/results/cosine.json";
+
+/// A retrieval strategy for the eval harness: query → ranked doc ids.
+type EvalStrategy = Box<dyn FnMut(&str) -> Result<Vec<String>, eval::EvalError>>;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -47,8 +54,10 @@ fn main() {
 fn usage() {
     eprintln!("usage: gs build-prompt [REPO]   (issue JSON on stdin)");
     eprintln!("       gs ingest [CORPUS_DIR]   (default: corpus)");
-    eprintln!("       gs query QUERY [CORPUS_DIR]   (default: corpus)");
-    eprintln!("       gs eval [CORPUS_DIR] [EVAL_SET]   (defaults: corpus, eval/evalset.json)");
+    eprintln!("       gs query [--embed] [--tier TIER] QUERY [DIR] [OLLAMA_URL]");
+    eprintln!("             --embed: cosine over INDEX_DIR (default: index); default: fulltext over CORPUS_DIR");
+    eprintln!("             --tier: pinned-source|docs-wiki|navigational (cosine only)");
+    eprintln!("       gs eval [--strategy fulltext|cosine] [CORPUS_DIR] [EVAL_SET]");
     eprintln!("       gs chunk [CORPUS_DIR] [INDEX_DIR]   (defaults: corpus, index)");
     eprintln!(
         "       gs embed [INDEX_DIR] [OLLAMA_URL]   (defaults: index, http://127.0.0.1:11434)"
@@ -112,21 +121,74 @@ fn cmd_ingest(mut args: impl Iterator<Item = String>) {
     }
 }
 
-/// `gs query QUERY [CORPUS_DIR]` — the deliberately-dumb retrieval baseline:
-/// plain `rg` full-text over the corpus, fully offline, ranked by match count
-/// per file with an evidence snippet. Every later retrieval strategy must
-/// measurably beat this.
+/// `gs query [--embed] [--tier TIER] QUERY [DIR] [OLLAMA_URL]` — two
+/// retrieval strategies behind one flag:
+/// - default: full-text `rg` over the corpus (the deliberately-dumb baseline,
+///   fully offline, ranked by match count with an evidence snippet);
+/// - `--embed`: embed the query via local Ollama and rank chunks by cosine
+///   similarity through the vector store, with provenance metadata per hit
+///   and an optional trust-tier filter.
 fn cmd_query(mut args: impl Iterator<Item = String>) {
-    let query = match args.next() {
-        Some(q) => q,
+    let mut embed_mode = false;
+    let mut tier: Option<TrustTier> = None;
+    let mut positional: Vec<String> = Vec::new();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--embed" => embed_mode = true,
+            "--tier" => {
+                let value = args.next().unwrap_or_else(|| {
+                    eprintln!("gs query: --tier requires a value");
+                    std::process::exit(2);
+                });
+                tier = Some(match parse_tier(&value) {
+                    Ok(t) => t,
+                    Err(msg) => {
+                        eprintln!("gs query: {msg}");
+                        std::process::exit(2);
+                    }
+                });
+            }
+            flag if flag.starts_with('-') && flag != "-" => {
+                eprintln!("gs query: unknown flag {flag}");
+                usage();
+                std::process::exit(2);
+            }
+            pos => positional.push(pos.to_string()),
+        }
+    }
+
+    let query = match positional.first() {
+        Some(q) => q.clone(),
         None => {
             eprintln!("gs query: missing QUERY argument");
             usage();
             std::process::exit(2);
         }
     };
+
+    if embed_mode {
+        let index_dir = PathBuf::from(
+            positional
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_INDEX_DIR.to_string()),
+        );
+        let server_url = positional
+            .get(2)
+            .cloned()
+            .unwrap_or_else(|| embed::DEFAULT_OLLAMA_URL.to_string());
+        cmd_query_cosine(&query, &index_dir, &server_url, tier);
+        return;
+    }
+
+    if tier.is_some() {
+        eprintln!("gs query: --tier only applies with --embed");
+        std::process::exit(2);
+    }
     let corpus_dir = PathBuf::from(
-        args.next()
+        positional
+            .get(1)
+            .cloned()
             .unwrap_or_else(|| DEFAULT_CORPUS_DIR.to_string()),
     );
 
@@ -149,16 +211,107 @@ fn cmd_query(mut args: impl Iterator<Item = String>) {
     }
 }
 
-/// `gs eval [CORPUS_DIR] [EVAL_SET]` — run the full-text baseline over the
-/// eval set, print recall@k (k=5, k=10) per query and overall, and persist
-/// the result to `eval/results/fulltext-baseline.json` so later retrieval
-/// strategies have a number to beat on the same eval set. Fully offline.
+/// The cosine query path: load the vector store, embed the query, rank, and
+/// print top-k hits with score + provenance metadata.
+fn cmd_query_cosine(query: &str, index_dir: &Path, server_url: &str, tier: Option<TrustTier>) {
+    let store = match VectorStore::load(index_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("gs query: {e}");
+            std::process::exit(1);
+        }
+    };
+    let call =
+        |inputs: &[String]| embed::ollama_embed(server_url, embed::DEFAULT_EMBED_MODEL, inputs);
+    let vectors = match call(&[query.to_string()]) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("gs query: {e}");
+            std::process::exit(1);
+        }
+    };
+    let hits = store.search(&vectors[0], vector::DEFAULT_TOP_K, tier);
+    if hits.is_empty() {
+        println!(
+            "no hits for {query:?} (store: {} chunks, dim {}, model {})",
+            store.len(),
+            store.dim,
+            store.model
+        );
+        return;
+    }
+    for (i, hit) in hits.iter().enumerate() {
+        println!(
+            "{}. ({:.3}) {} — {}",
+            i + 1,
+            hit.score,
+            hit.chunk.source,
+            hit.chunk.heading
+        );
+        println!("   {}", snippet(&hit.chunk.text, 140));
+        println!(
+            "   license: {} | tier: {}",
+            hit.chunk.license,
+            tier_name(hit.chunk.tier)
+        );
+    }
+}
+
+/// Map a trust-tier name (the serde rename) to its enum value.
+fn parse_tier(s: &str) -> Result<TrustTier, String> {
+    match s {
+        "pinned-source" => Ok(TrustTier::PinnedSource),
+        "docs-wiki" => Ok(TrustTier::DocsWiki),
+        "navigational" => Ok(TrustTier::Navigational),
+        other => Err(format!(
+            "unknown tier {other:?} (expected pinned-source|docs-wiki|navigational)"
+        )),
+    }
+}
+
+/// The serde rename of a trust tier (stable, user-facing).
+fn tier_name(t: TrustTier) -> String {
+    match serde_json::to_value(t) {
+        Ok(serde_json::Value::String(s)) => s,
+        _ => "unknown".to_string(),
+    }
+}
+
+/// First `max` characters of `text` (whitespace-trimmed), ellipsized.
+fn snippet(text: &str, max: usize) -> String {
+    let t = text.trim();
+    if t.chars().count() <= max {
+        return t.to_string();
+    }
+    let cut: String = t.chars().take(max).collect();
+    format!("{cut}…")
+}
+
+/// `gs eval [--strategy fulltext|cosine] [CORPUS_DIR] [EVAL_SET]` — run a
+/// retrieval strategy over the eval set, print recall@k (k=5, k=10) per
+/// query and overall, and persist the result to
+/// `eval/results/<strategy>.json` so every strategy has a number to beat on
+/// the same eval set. `fulltext` is the offline baseline; `cosine` embeds
+/// each query via local Ollama and retrieves through the vector store, then
+/// prints the delta against the persisted fulltext baseline.
 fn cmd_eval(mut args: impl Iterator<Item = String>) {
+    let mut strategy_name = "fulltext".to_string();
+    let first = args.next();
+    if first.as_deref() == Some("--strategy") {
+        strategy_name = match args.next() {
+            Some(s) => s,
+            None => {
+                eprintln!("gs eval: --strategy requires a value (fulltext|cosine)");
+                std::process::exit(2);
+            }
+        };
+    }
+    let mut rest = first.into_iter().chain(args);
     let corpus_dir = PathBuf::from(
-        args.next()
+        rest.next()
             .unwrap_or_else(|| DEFAULT_CORPUS_DIR.to_string()),
     );
-    let eval_set_path = PathBuf::from(args.next().unwrap_or_else(|| DEFAULT_EVAL_SET.to_string()));
+    let eval_set_path = PathBuf::from(rest.next().unwrap_or_else(|| DEFAULT_EVAL_SET.to_string()));
 
     let set = match eval::EvalSet::load(&eval_set_path) {
         Ok(set) => set,
@@ -198,8 +351,38 @@ fn cmd_eval(mut args: impl Iterator<Item = String>) {
         }
     }
 
-    let mut strategy = |query: &str| eval::fulltext_doc_ids(&corpus_dir, query);
-    let mut result = match eval::run_eval("fulltext", &mut strategy, &set) {
+    let (result_path, mut strategy): (PathBuf, EvalStrategy) = match strategy_name.as_str() {
+        "fulltext" => (
+            PathBuf::from(BASELINE_RESULT),
+            Box::new(move |query: &str| eval::fulltext_doc_ids(&corpus_dir, query)),
+        ),
+        "cosine" => {
+            let index_dir = PathBuf::from(DEFAULT_INDEX_DIR);
+            let store = match VectorStore::load(&index_dir) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("gs eval: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let server_url = embed::DEFAULT_OLLAMA_URL.to_string();
+            (
+                PathBuf::from(COSINE_RESULT),
+                Box::new(move |query: &str| {
+                    let mut call = |inputs: &[String]| {
+                        embed::ollama_embed(&server_url, embed::DEFAULT_EMBED_MODEL, inputs)
+                    };
+                    eval::cosine_doc_ids(&store, &mut call, query)
+                }),
+            )
+        }
+        other => {
+            eprintln!("gs eval: unknown strategy {other:?} (fulltext|cosine)");
+            std::process::exit(2);
+        }
+    };
+
+    let mut result = match eval::run_eval(&strategy_name, &mut strategy, &set) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("gs eval: {e}");
@@ -219,12 +402,30 @@ fn cmd_eval(mut args: impl Iterator<Item = String>) {
         result.overall_recall_5, result.overall_recall_10, result.strategy
     );
 
-    let result_path = PathBuf::from(BASELINE_RESULT);
     match eval::save_result(&result_path, &result) {
         Ok(()) => println!("saved {}", result_path.display()),
         Err(e) => {
             eprintln!("gs eval: cannot write {}: {e}", result_path.display());
             std::process::exit(1);
+        }
+    }
+
+    if strategy_name != "fulltext" {
+        match eval::EvalResult::load(Path::new(BASELINE_RESULT)) {
+            Ok(base) => {
+                let hash = base.corpus_hash.get(..8).unwrap_or(&base.corpus_hash);
+                println!(
+                    "vs fulltext baseline (corpus {hash}): recall@5 {:+.3}  recall@10 {:+.3}",
+                    result.overall_recall_5 - base.overall_recall_5,
+                    result.overall_recall_10 - base.overall_recall_10
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "gs eval: cannot compare to baseline {}: {e}",
+                    BASELINE_RESULT
+                );
+            }
         }
     }
 }

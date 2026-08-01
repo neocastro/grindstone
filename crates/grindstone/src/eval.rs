@@ -139,6 +139,14 @@ fn mean(scores: &[QueryScore], f: impl Fn(&QueryScore) -> f64) -> f64 {
     scores.iter().map(f).sum::<f64>() / scores.len() as f64
 }
 
+impl EvalResult {
+    /// Load a persisted eval result from JSON.
+    pub fn load(path: &Path) -> Result<Self, EvalError> {
+        let text = std::fs::read_to_string(path).map_err(EvalError::Io)?;
+        serde_json::from_str(&text).map_err(EvalError::Json)
+    }
+}
+
 /// Persist an eval result as pretty JSON.
 pub fn save_result(path: &Path, result: &EvalResult) -> Result<(), EvalError> {
     if let Some(parent) = path.parent() {
@@ -158,12 +166,41 @@ pub fn fulltext_doc_ids(corpus_dir: &Path, query: &str) -> Result<Vec<String>, E
         .collect())
 }
 
+/// Cosine strategy adapter: embed `query` via the injectable embedder, rank
+/// chunks through the vector store, and map the top-k hits to doc ids
+/// (deduped source names, rank order preserved).
+///
+/// A document with many matching chunks appears once, at its best position —
+/// the same doc-id granularity the full-text baseline is scored on.
+pub fn cosine_doc_ids(
+    store: &crate::vector::VectorStore,
+    embed: &mut crate::embed::Embedder,
+    query: &str,
+) -> Result<Vec<String>, EvalError> {
+    let embeddings = embed(&[query.to_string()]).map_err(EvalError::Embed)?;
+    let q = embeddings.first().ok_or_else(|| {
+        EvalError::Embed(crate::embed::EmbedError::Http(
+            "embedder returned no vectors".into(),
+        ))
+    })?;
+    let hits = store.search(q, crate::vector::DEFAULT_TOP_K, None);
+    let mut seen = std::collections::HashSet::new();
+    let mut doc_ids = Vec::new();
+    for hit in hits {
+        if seen.insert(hit.chunk.source.clone()) {
+            doc_ids.push(hit.chunk.source);
+        }
+    }
+    Ok(doc_ids)
+}
+
 /// Errors produced by the eval harness.
 #[derive(Debug)]
 pub enum EvalError {
     Io(std::io::Error),
     Json(serde_json::Error),
     Fulltext(crate::fulltext::FulltextError),
+    Embed(crate::embed::EmbedError),
 }
 
 impl std::fmt::Display for EvalError {
@@ -172,6 +209,7 @@ impl std::fmt::Display for EvalError {
             EvalError::Io(e) => write!(f, "eval I/O error: {e}"),
             EvalError::Json(e) => write!(f, "eval JSON error: {e}"),
             EvalError::Fulltext(e) => write!(f, "fulltext error: {e}"),
+            EvalError::Embed(e) => write!(f, "embed error: {e}"),
         }
     }
 }
@@ -353,6 +391,84 @@ mod tests {
         let result = run_eval("fulltext", &mut strategy, &set).unwrap();
         assert_eq!(result.queries[0].hits, vec!["rust-book".to_string()]);
         assert_eq!(result.queries[0].recall_5, 1.0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- cosine strategy adapter tests (fake embedder + tiny store) ---
+
+    /// Persist a 3-chunk store (2 rust-book chunks + 1 clippy chunk) into `dir`.
+    fn write_tiny_store(dir: &std::path::Path) {
+        use crate::chunk::{Chunk, ChunksFile};
+        use crate::embed::EmbeddingsFile;
+        use crate::manifest::TrustTier::PinnedSource;
+        use std::collections::BTreeMap;
+
+        let mk = |id: &str, source: &str, text: &str| Chunk {
+            id: id.into(),
+            source: source.into(),
+            license: "MIT".into(),
+            tier: PinnedSource,
+            heading: "H".into(),
+            tokens: 1,
+            text: text.into(),
+        };
+        ChunksFile {
+            version: 1,
+            chunks: vec![
+                mk("r1", "rust-book", "borrow checker"),
+                mk("r2", "rust-book", "borrow checker again"),
+                mk("c1", "clippy", "restriction lints"),
+            ],
+        }
+        .save(&dir.join("chunks.json"))
+        .unwrap();
+
+        let mut vectors = BTreeMap::new();
+        vectors.insert("r1".to_string(), vec![1.0f32, 0.0]);
+        vectors.insert("r2".to_string(), vec![1.0f32, 0.0]);
+        vectors.insert("c1".to_string(), vec![0.0f32, 1.0]);
+        EmbeddingsFile {
+            model: "fake".into(),
+            dim: 2,
+            vectors,
+        }
+        .save(&dir.join("embeddings.json"))
+        .unwrap();
+    }
+
+    #[test]
+    fn cosine_doc_ids_dedups_sources_in_rank_order() {
+        let dir = std::env::temp_dir().join(format!("gs-eval-cos-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_tiny_store(&dir);
+        let store = crate::vector::VectorStore::load(&dir).unwrap();
+
+        let mut embed = |_: &[String]| -> Result<Vec<Vec<f32>>, crate::embed::EmbedError> {
+            Ok(vec![vec![1.0, 0.0]])
+        };
+        let ids = cosine_doc_ids(&store, &mut embed, "borrow checker").unwrap();
+        // Two rust-book chunks tie (both score 1.0); doc ids dedupe in rank
+        // order: rust-book first (two chunks), then clippy.
+        assert_eq!(ids, vec!["rust-book".to_string(), "clippy".to_string()]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cosine_doc_ids_propagates_embed_error() {
+        let dir = std::env::temp_dir().join(format!("gs-eval-cos-err-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_tiny_store(&dir);
+        let store = crate::vector::VectorStore::load(&dir).unwrap();
+
+        let mut embed = |_: &[String]| -> Result<Vec<Vec<f32>>, crate::embed::EmbedError> {
+            Err(crate::embed::EmbedError::Http("ollama down".into()))
+        };
+        let err = cosine_doc_ids(&store, &mut embed, "x").unwrap_err();
+        assert!(matches!(err, EvalError::Embed(_)));
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

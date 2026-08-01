@@ -9,6 +9,7 @@ pub mod eval;
 pub mod fulltext;
 pub mod ingest;
 pub mod manifest;
+pub mod vector;
 
 use serde::{Deserialize, Serialize};
 
