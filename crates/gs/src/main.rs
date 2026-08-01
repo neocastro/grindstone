@@ -467,10 +467,17 @@ fn cmd_eval(mut args: impl Iterator<Item = String>) {
     }
 
     let (result_path, mut strategy): (PathBuf, EvalStrategy) = match strategy_name.as_str() {
-        "fulltext" => (
-            PathBuf::from(BASELINE_RESULT),
-            Box::new(move |query: &str| eval::fulltext_doc_ids(&corpus_dir, query)),
-        ),
+        "fulltext" => {
+            // Preferred adapter (rg) when present; the in-process scan is a
+            // production fallback, so the baseline runs even without rg (CI).
+            let searcher = fulltext::default_searcher();
+            (
+                PathBuf::from(BASELINE_RESULT),
+                Box::new(move |query: &str| {
+                    eval::fulltext_doc_ids(searcher.as_ref(), &corpus_dir, query)
+                }),
+            )
+        }
         "cosine" => {
             let index_dir = PathBuf::from(DEFAULT_INDEX_DIR);
             let store = match VectorStore::load(&index_dir) {
