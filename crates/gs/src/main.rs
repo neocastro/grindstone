@@ -4,9 +4,7 @@ use grindstone::{
     build_prompt, build_prompt_with_context, chunk, embed, eval, fulltext, hybrid, indexbuild,
     ingest,
     manifest::{Manifest, TrustTier},
-    retrieve_context,
-    vector::{self, VectorStore},
-    Issue,
+    retrieve_context, vector, Issue,
 };
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -329,7 +327,9 @@ fn cmd_query_dense(
         let hits = hybrid::hybrid_search(&store, &index, &q, query, vector::DEFAULT_TOP_K, tier);
         (store, hits)
     } else {
-        let store = match VectorStore::load(index_dir) {
+        // Cosine-only: load the store through the library (RAG-12b), which
+        // skips the sparse index build the hybrid path needs.
+        let store = match indexbuild::load_vector_store(index_dir) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("gs query: {e}");
