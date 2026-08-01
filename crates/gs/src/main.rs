@@ -1,8 +1,9 @@
 //! gs — grindstone CLI.
 
 use grindstone::{
-    build_prompt, chunk, embed, eval, fulltext, ingest, manifest,
+    build_prompt, build_prompt_with_context, chunk, embed, eval, fulltext, ingest, manifest,
     manifest::{Manifest, TrustTier},
+    retrieve_context,
     vector::{self, VectorStore},
     Issue,
 };
@@ -52,7 +53,8 @@ fn main() {
 }
 
 fn usage() {
-    eprintln!("usage: gs build-prompt [REPO]   (issue JSON on stdin)");
+    eprintln!("usage: gs build-prompt [REPO] [--no-rag] [--index DIR] [--ollama URL]");
+    eprintln!("             (issue JSON on stdin; retrieves corpus context by default)");
     eprintln!("       gs ingest [CORPUS_DIR]   (default: corpus)");
     eprintln!("       gs query [--embed] [--tier TIER] QUERY [DIR] [OLLAMA_URL]");
     eprintln!("             --embed: cosine over INDEX_DIR (default: index); default: fulltext over CORPUS_DIR");
@@ -65,8 +67,54 @@ fn usage() {
     eprintln!("       gs --version");
 }
 
+/// `gs build-prompt [REPO] [--no-rag] [--index DIR] [--ollama URL]` — read
+/// issue JSON on stdin and emit the hardened agent prompt.
+///
+/// By default (RAG-5) the issue title + body are embedded via the local
+/// Ollama server and the top-k corpus chunks are injected between the
+/// untrusted frame and the working rules — retrieve-then-inject: the agent
+/// receives a static, grounded prompt and never calls retrieval tools. If the
+/// index is missing/corrupt or the embed fails, the run degrades: a warning
+/// goes to stderr, the prompt is emitted ungrounded, and the exit code stays
+/// 0 — retrieval never blocks the run. `--no-rag` bypasses retrieval entirely
+/// for debugging.
+///
+/// The index dir defaults to `$GS_INDEX_DIR`, then `index` (cwd-relative);
+/// the grinding runner in the sibling tlarc repo passes it explicitly.
 fn cmd_build_prompt(mut args: impl Iterator<Item = String>) {
-    let repo = args.next().unwrap_or_else(|| "tlarc".to_string());
+    let mut no_rag = false;
+    let mut index_dir = std::env::var("GS_INDEX_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_INDEX_DIR));
+    let mut server_url = embed::DEFAULT_OLLAMA_URL.to_string();
+    let mut positional: Vec<String> = Vec::new();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--no-rag" => no_rag = true,
+            "--index" => {
+                index_dir = PathBuf::from(args.next().unwrap_or_else(|| {
+                    eprintln!("gs build-prompt: --index requires a value");
+                    std::process::exit(2);
+                }));
+            }
+            "--ollama" => {
+                server_url = args.next().unwrap_or_else(|| {
+                    eprintln!("gs build-prompt: --ollama requires a value");
+                    std::process::exit(2);
+                });
+            }
+            flag if flag.starts_with('-') && flag != "-" => {
+                eprintln!("gs build-prompt: unknown flag {flag}");
+                usage();
+                std::process::exit(2);
+            }
+            pos => positional.push(pos.to_string()),
+        }
+    }
+    let repo = positional
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "tlarc".to_string());
 
     let mut input = String::new();
     std::io::stdin()
@@ -76,7 +124,34 @@ fn cmd_build_prompt(mut args: impl Iterator<Item = String>) {
     let issue: Issue = serde_json::from_str(input.trim())
         .expect("stdin must be issue JSON: {number, title, body}");
 
-    print!("{}", build_prompt(&issue, &repo));
+    if no_rag {
+        print!("{}", build_prompt(&issue, &repo));
+        return;
+    }
+
+    // stdout must be exactly the prompt (the runner captures it into
+    // PROMPT=...), so every diagnostic goes to stderr.
+    let mut call =
+        |inputs: &[String]| embed::ollama_embed(&server_url, embed::DEFAULT_EMBED_MODEL, inputs);
+    match retrieve_context(
+        &index_dir,
+        &issue,
+        grindstone::DEFAULT_CONTEXT_CHUNKS,
+        &mut call,
+    ) {
+        Ok(chunks) => {
+            eprintln!(
+                "gs build-prompt: grounded with {} chunk(s) from {}",
+                chunks.len(),
+                index_dir.display()
+            );
+            print!("{}", build_prompt_with_context(&issue, &repo, &chunks));
+        }
+        Err(e) => {
+            eprintln!("gs build-prompt: warning: retrieval failed ({e}); proceeding ungrounded");
+            print!("{}", build_prompt(&issue, &repo));
+        }
+    }
 }
 
 /// `gs ingest [CORPUS_DIR]` — fetch every source whose corpus file is missing
@@ -252,7 +327,7 @@ fn cmd_query_cosine(query: &str, index_dir: &Path, server_url: &str, tier: Optio
         println!(
             "   license: {} | tier: {}",
             hit.chunk.license,
-            tier_name(hit.chunk.tier)
+            hit.chunk.tier.name()
         );
     }
 }
@@ -266,14 +341,6 @@ fn parse_tier(s: &str) -> Result<TrustTier, String> {
         other => Err(format!(
             "unknown tier {other:?} (expected pinned-source|docs-wiki|navigational)"
         )),
-    }
-}
-
-/// The serde rename of a trust tier (stable, user-facing).
-fn tier_name(t: TrustTier) -> String {
-    match serde_json::to_value(t) {
-        Ok(serde_json::Value::String(s)) => s,
-        _ => "unknown".to_string(),
     }
 }
 

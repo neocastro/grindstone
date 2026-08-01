@@ -49,6 +49,18 @@ pub enum TrustTier {
     Navigational,
 }
 
+impl TrustTier {
+    /// The stable, user-facing name (must match the serde rename exactly —
+    /// it is the single source of truth for display and CLI parsing).
+    pub fn name(&self) -> &'static str {
+        match self {
+            TrustTier::PinnedSource => "pinned-source",
+            TrustTier::DocsWiki => "docs-wiki",
+            TrustTier::Navigational => "navigational",
+        }
+    }
+}
+
 impl Source {
     /// Corpus file name this source is stored under (e.g. `rust-book.html`).
     pub fn filename(&self) -> String {
@@ -98,6 +110,26 @@ impl std::error::Error for ManifestError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tier_names_match_serde_renames() {
+        assert_eq!(TrustTier::PinnedSource.name(), "pinned-source");
+        assert_eq!(TrustTier::DocsWiki.name(), "docs-wiki");
+        assert_eq!(TrustTier::Navigational.name(), "navigational");
+        // name() must stay in lockstep with the serde rename (single source of truth).
+        assert_eq!(
+            serde_json::to_value(TrustTier::PinnedSource).unwrap(),
+            serde_json::Value::String("pinned-source".into())
+        );
+        assert_eq!(
+            serde_json::to_value(TrustTier::DocsWiki).unwrap(),
+            serde_json::Value::String("docs-wiki".into())
+        );
+        assert_eq!(
+            serde_json::to_value(TrustTier::Navigational).unwrap(),
+            serde_json::Value::String("navigational".into())
+        );
+    }
 
     fn sample_source() -> Source {
         Source {
