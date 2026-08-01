@@ -28,6 +28,16 @@ _Avoid_: "paragraph" — chunks are structural units, not prose units.
 The vector representation of a chunk, produced by `nomic-embed-text` via the
 local Ollama server.
 
+**Index build**:
+The library module that owns the whole pipeline walk end-to-end —
+manifest → corpus files → chunks → embeddings → vector store
+(`indexbuild::build_index`). The determinism contract lives here: same
+manifest + same corpus → identical index artifacts, bit-for-bit. The CLI
+stays per-stage (`gs chunk`, `gs embed`) but delegates the walks to Index
+build.
+_Avoid_: "the pipeline" when the library's orchestration path is meant — the
+CLI's per-stage commands are entry points, not the walk.
+
 **Vector store**:
 The persisted chunk + embedding + metadata index (deterministic JSON artifacts + in-memory cosine at this scale — see RAG-4).
 _Avoid_: "database" when referring to the index.
@@ -58,6 +68,8 @@ the mechanism.
 
 - A **corpus** is described by a **manifest**
 - A **manifest** produces **chunks** via the chunker
+- **Index build** walks a **manifest** and **corpus** to **chunks**, then to
+  **embeddings**, assembling the **vector store**
 - **Chunks** are embedded and stored in the **vector store**
 - A **retrieval strategy** queries the **vector store**
 - The **eval harness** scores every **retrieval strategy**
