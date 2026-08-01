@@ -15,6 +15,9 @@ The pinned list of corpus sources (URL, version, license, content hash). The
 single source of truth: same manifest → same corpus state (deterministic
 rebuilds).
 _Avoid_: "config" when referring to the pinned sources.
+Sources carry a `format` (`html` = rendered doc fetched by URL, `text` = a
+local source checkout assembled by ingest — the TLA+ Java corpus) and a
+**trust tier**.
 
 **Chunk**:
 A heading-aware slice of a document (~500 tokens with overlap), with stable

@@ -2,7 +2,7 @@
 
 use grindstone::{
     build_prompt, build_prompt_with_context, chunk, embed, eval, fulltext, ingest, manifest,
-    manifest::{Manifest, TrustTier},
+    manifest::{Manifest, SourceFormat, TrustTier},
     retrieve_context,
     vector::{self, VectorStore},
     Issue,
@@ -173,7 +173,13 @@ fn cmd_ingest(mut args: impl Iterator<Item = String>) {
         }
     };
 
-    let mut fetcher = ingest::http_fetcher;
+    let mut fetcher = |url: &str| -> Result<Vec<u8>, ingest::IngestError> {
+        if url.starts_with("file://") {
+            ingest::local_text_fetcher(url)
+        } else {
+            ingest::http_fetcher(url)
+        }
+    };
     match ingest::ingest(&manifest, &corpus_dir, &mut fetcher) {
         Ok(report) => {
             for (source, action) in &report.actions {
@@ -363,17 +369,24 @@ fn snippet(text: &str, max: usize) -> String {
 /// prints the delta against the persisted fulltext baseline.
 fn cmd_eval(mut args: impl Iterator<Item = String>) {
     let mut strategy_name = "fulltext".to_string();
-    let first = args.next();
-    if first.as_deref() == Some("--strategy") {
-        strategy_name = match args.next() {
-            Some(s) => s,
-            None => {
-                eprintln!("gs eval: --strategy requires a value (fulltext|cosine)");
+    let mut positional: Vec<String> = Vec::new();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--strategy" => {
+                strategy_name = args.next().unwrap_or_else(|| {
+                    eprintln!("gs eval: --strategy requires a value (fulltext|cosine)");
+                    std::process::exit(2);
+                });
+            }
+            flag if flag.starts_with('-') && flag != "-" => {
+                eprintln!("gs eval: unknown flag {flag}");
+                usage();
                 std::process::exit(2);
             }
-        };
+            pos => positional.push(pos.to_string()),
+        }
     }
-    let mut rest = first.into_iter().chain(args);
+    let mut rest = positional.into_iter();
     let corpus_dir = PathBuf::from(
         rest.next()
             .unwrap_or_else(|| DEFAULT_CORPUS_DIR.to_string()),
@@ -519,14 +532,17 @@ fn cmd_chunk(mut args: impl Iterator<Item = String>) {
     let mut chunks = Vec::new();
     for source in &manifest.sources {
         let path = corpus_dir.join(source.filename());
-        let html = match std::fs::read_to_string(&path) {
+        let content = match std::fs::read_to_string(&path) {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("gs chunk: cannot read {}: {e}", path.display());
                 std::process::exit(1);
             }
         };
-        let doc_chunks = chunk::chunk_source(&html, source);
+        let doc_chunks = match source.format {
+            SourceFormat::Html => chunk::chunk_source(&content, source),
+            SourceFormat::Text => chunk::chunk_text(&content, source),
+        };
         println!("{:>6} chunks  {}", doc_chunks.len(), source.name);
         chunks.extend(doc_chunks);
     }
@@ -561,11 +577,52 @@ fn cmd_embed(mut args: impl Iterator<Item = String>) {
 
     let mut call =
         |inputs: &[String]| embed::ollama_embed(&server_url, embed::DEFAULT_EMBED_MODEL, inputs);
-    let embeddings = match embed::embed_chunks(
+    let started = std::time::Instant::now();
+    let mut last_report = started;
+    let mut on_progress = |done: usize, total: usize| {
+        let now = std::time::Instant::now();
+        let throttle = now.duration_since(last_report);
+        if done < total && throttle < std::time::Duration::from_secs(2) {
+            return; // report at most every 2s (always report the final batch)
+        }
+        last_report = now;
+        let elapsed = now.duration_since(started).as_secs_f64().max(0.001);
+        let rate = done as f64 / elapsed; // chunks/sec
+        let pct = 100.0 * done as f64 / total as f64;
+        let remaining = if rate > 0.0 {
+            ((total - done) as f64 / rate) as u64
+        } else {
+            u64::MAX
+        };
+        eprintln!(
+            "gs embed: {done}/{total} chunks ({pct:.1}%) — {rate:.0} chunks/s, ~{remaining}s remaining"
+        );
+    };
+    // Incremental: reuse existing vectors for unchanged chunks (content-
+    // addressed ids), embed only what changed, prune stale ids.
+    let existing = embed::EmbeddingsFile::load(&index_dir.join("embeddings.json")).ok();
+    let reused = existing
+        .as_ref()
+        .map(|e| {
+            e.vectors
+                .keys()
+                .filter(|id| file.chunks.iter().any(|c| &c.id == *id))
+                .count()
+        })
+        .unwrap_or(0);
+    if reused > 0 {
+        eprintln!(
+            "gs embed: reusing {reused} of {} chunk embeddings",
+            file.chunks.len()
+        );
+    }
+    let embeddings = match embed::embed_chunks_incremental(
         &file.chunks,
         embed::DEFAULT_EMBED_MODEL,
         embed::DEFAULT_BATCH_SIZE,
         &mut call,
+        existing.as_ref(),
+        Some(&mut on_progress),
     ) {
         Ok(e) => e,
         Err(e) => {

@@ -108,30 +108,65 @@ pub fn embed_chunks(
     model: &str,
     batch_size: usize,
     call: &mut Embedder,
+    on_progress: Option<&mut dyn FnMut(usize, usize)>,
 ) -> Result<EmbeddingsFile, EmbedError> {
-    let mut vectors = BTreeMap::new();
-    let mut dim: Option<usize> = None;
+    embed_chunks_incremental(chunks, model, batch_size, call, None, on_progress)
+}
+
+/// Embed only the chunks missing from `existing` (content-addressed ids:
+/// same id ⇒ same text ⇒ same vector, so reuse is exact), prune stale ids
+/// that no longer correspond to a chunk, and report progress over the full
+/// chunk count. An existing file with a different `model` is ignored (full
+/// re-embed). This is what makes corpus iteration cheap: adding a doc or
+/// fixing the chunker re-embeds only what changed.
+pub fn embed_chunks_incremental(
+    chunks: &[Chunk],
+    model: &str,
+    batch_size: usize,
+    call: &mut Embedder,
+    existing: Option<&EmbeddingsFile>,
+    mut on_progress: Option<&mut dyn FnMut(usize, usize)>,
+) -> Result<EmbeddingsFile, EmbedError> {
+    let reuse = existing.filter(|e| e.model == model);
+    let mut vectors: BTreeMap<String, Vec<f32>> =
+        reuse.map(|e| e.vectors.clone()).unwrap_or_default();
+    if reuse.is_some() {
+        // Drop embeddings whose chunk no longer exists (corpus shrank).
+        vectors.retain(|id, _| chunks.iter().any(|c| &c.id == id));
+    }
+    let mut dim: Option<usize> = reuse.map(|e| e.dim);
+    let mut done = vectors.len();
     for batch in chunks.chunks(batch_size.max(1)) {
-        let inputs: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
-        let embeddings = call(&inputs)?;
-        if embeddings.len() != batch.len() {
-            return Err(EmbedError::DimensionMismatch {
-                expected: batch.len(),
-                got: embeddings.len(),
-            });
-        }
-        for (chunk, embedding) in batch.iter().zip(embeddings) {
-            match dim {
-                None => dim = Some(embedding.len()),
-                Some(d) if d != embedding.len() => {
-                    return Err(EmbedError::DimensionMismatch {
-                        expected: d,
-                        got: embedding.len(),
-                    });
-                }
-                _ => {}
+        let pending: Vec<&Chunk> = batch
+            .iter()
+            .filter(|c| !vectors.contains_key(&c.id))
+            .collect();
+        if !pending.is_empty() {
+            let inputs: Vec<String> = pending.iter().map(|c| c.text.clone()).collect();
+            let embeddings = call(&inputs)?;
+            if embeddings.len() != pending.len() {
+                return Err(EmbedError::DimensionMismatch {
+                    expected: pending.len(),
+                    got: embeddings.len(),
+                });
             }
-            vectors.insert(chunk.id.clone(), embedding);
+            for (chunk, embedding) in pending.iter().zip(embeddings) {
+                match dim {
+                    None => dim = Some(embedding.len()),
+                    Some(d) if d != embedding.len() => {
+                        return Err(EmbedError::DimensionMismatch {
+                            expected: d,
+                            got: embedding.len(),
+                        });
+                    }
+                    _ => {}
+                }
+                vectors.insert(chunk.id.clone(), embedding);
+            }
+        }
+        done += pending.len();
+        if let Some(cb) = on_progress.as_deref_mut() {
+            cb(done, chunks.len());
         }
     }
     Ok(EmbeddingsFile {
@@ -196,7 +231,7 @@ mod tests {
         let mut fake = |inputs: &[String]| -> Result<Vec<Vec<f32>>, EmbedError> {
             Ok(inputs.iter().map(|s| vec![s.len() as f32, 0.5]).collect())
         };
-        let file = embed_chunks(&chunks(5), "fake-model", 2, &mut fake).unwrap();
+        let file = embed_chunks(&chunks(5), "fake-model", 2, &mut fake, None).unwrap();
         assert_eq!(file.model, "fake-model");
         assert_eq!(file.dim, 2);
         assert_eq!(file.vectors.len(), 5);
@@ -210,6 +245,116 @@ mod tests {
     }
 
     #[test]
+    fn embed_chunks_reports_progress() {
+        let mut fake = |inputs: &[String]| -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(inputs.iter().map(|s| vec![s.len() as f32, 0.5]).collect())
+        };
+        let mut seen: Vec<(usize, usize)> = Vec::new();
+        let file = {
+            let mut cb = |done: usize, total: usize| seen.push((done, total));
+            embed_chunks(&chunks(5), "fake-model", 2, &mut fake, Some(&mut cb)).unwrap()
+        };
+        assert_eq!(file.vectors.len(), 5);
+        // Batches of 2 over 5 chunks → (2,5), (4,5), then the final partial (5,5).
+        assert_eq!(seen, vec![(2, 5), (4, 5), (5, 5)]);
+    }
+
+    #[test]
+    fn embed_chunks_incremental_reuses_existing_embeddings() {
+        let chunks_all = chunks(5); // chunk-0..chunk-4
+        let existing = EmbeddingsFile {
+            model: "fake-model".into(),
+            dim: 2,
+            vectors: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("chunk-0".into(), vec![1.0, 2.0]);
+                m.insert("chunk-1".into(), vec![3.0, 4.0]);
+                m
+            },
+        };
+        let mut called: Vec<usize> = Vec::new();
+        let mut fake = |inputs: &[String]| -> Result<Vec<Vec<f32>>, EmbedError> {
+            called.push(inputs.len());
+            Ok(inputs.iter().map(|s| vec![s.len() as f32, 0.5]).collect())
+        };
+        let file = embed_chunks_incremental(
+            &chunks_all,
+            "fake-model",
+            2,
+            &mut fake,
+            Some(&existing),
+            None,
+        )
+        .unwrap();
+        assert_eq!(file.vectors.len(), 5);
+        // chunk-0/1 reused verbatim (embedder never called for them).
+        assert_eq!(file.vectors["chunk-0"], vec![1.0, 2.0]);
+        assert_eq!(file.vectors["chunk-1"], vec![3.0, 4.0]);
+        // Only the 3 missing chunks were embedded: batches of 2 + 1.
+        assert_eq!(called, vec![2, 1]);
+    }
+
+    #[test]
+    fn embed_chunks_incremental_prunes_stale_ids() {
+        let chunks_now = chunks(3); // chunk-0..chunk-2 (chunk-3/4 gone)
+        let existing = EmbeddingsFile {
+            model: "fake-model".into(),
+            dim: 2,
+            vectors: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("chunk-0".into(), vec![1.0, 0.0]);
+                m.insert("chunk-2".into(), vec![0.0, 1.0]);
+                m.insert("chunk-9".into(), vec![9.0, 9.0]); // stale: no such chunk
+                m
+            },
+        };
+        let mut fake = |inputs: &[String]| -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(inputs.iter().map(|s| vec![s.len() as f32, 0.5]).collect())
+        };
+        let file = embed_chunks_incremental(
+            &chunks_now,
+            "fake-model",
+            2,
+            &mut fake,
+            Some(&existing),
+            None,
+        )
+        .unwrap();
+        assert_eq!(file.vectors.len(), 3); // chunk-0 reused, chunk-1 new, chunk-2 reused
+        assert!(!file.vectors.contains_key("chunk-9"), "stale id pruned");
+        assert_eq!(file.vectors["chunk-0"], vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn embed_chunks_incremental_ignores_existing_on_model_mismatch() {
+        let existing = EmbeddingsFile {
+            model: "old-model".into(),
+            dim: 2,
+            vectors: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("chunk-0".into(), vec![9.0, 9.0]);
+                m
+            },
+        };
+        let mut fake = |inputs: &[String]| -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(inputs.iter().map(|s| vec![s.len() as f32, 0.5]).collect())
+        };
+        let file = embed_chunks_incremental(
+            &chunks(2),
+            "fake-model",
+            2,
+            &mut fake,
+            Some(&existing),
+            None,
+        )
+        .unwrap();
+        assert_eq!(file.model, "fake-model");
+        assert_eq!(file.vectors.len(), 2);
+        // Re-embedded fresh, not the old value.
+        assert_eq!(file.vectors["chunk-0"], vec![6.0, 0.5]);
+    }
+
+    #[test]
     fn embed_chunks_rejects_wrong_batch_count() {
         let mut fake = |inputs: &[String]| -> Result<Vec<Vec<f32>>, EmbedError> {
             // Return one fewer embedding than requested.
@@ -218,7 +363,7 @@ mod tests {
                 .map(|s| vec![s.len() as f32])
                 .collect())
         };
-        let err = embed_chunks(&chunks(2), "fake", 2, &mut fake).unwrap_err();
+        let err = embed_chunks(&chunks(2), "fake", 2, &mut fake, None).unwrap_err();
         assert!(matches!(err, EmbedError::DimensionMismatch { .. }));
     }
 
@@ -232,7 +377,7 @@ mod tests {
                 .map(|s| vec![s.len() as f32; calls as usize])
                 .collect())
         };
-        let err = embed_chunks(&chunks(3), "fake", 2, &mut fake).unwrap_err();
+        let err = embed_chunks(&chunks(3), "fake", 2, &mut fake, None).unwrap_err();
         assert!(matches!(err, EmbedError::DimensionMismatch { .. }));
     }
 

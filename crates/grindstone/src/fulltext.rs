@@ -18,7 +18,7 @@ pub struct Hit {
     pub snippet: String,
 }
 
-/// Search all `*.html` files under `corpus_dir` for `query`.
+/// Search all `*.html` and `*.txt` corpus documents under `corpus_dir` for `query`.
 ///
 /// Ranking: total match count per file, descending; ties broken by file name
 /// (deterministic). The query is passed to `rg` as a literal argument — never
@@ -36,7 +36,11 @@ pub fn search(corpus_dir: &Path, query: &str) -> Result<Vec<Hit>, FulltextError>
     let mut files: Vec<_> = std::fs::read_dir(corpus_dir)
         .map_err(FulltextError::Io)?
         .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "html"))
+        .filter(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|ext| ext == "html" || ext == "txt")
+        })
         .map(|e| e.path())
         .collect();
     files.sort();

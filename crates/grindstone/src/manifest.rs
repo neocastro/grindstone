@@ -16,6 +16,21 @@ pub struct Manifest {
     pub sources: Vec<Source>,
 }
 
+/// How a corpus source's document is produced: rendered HTML (fetched by
+/// URL, heading-chunked) or plain text assembled from a local source
+/// checkout (marker-chunked, e.g. the TLA+ Java corpus).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SourceFormat {
+    /// Rendered HTML document, fetched from `url` (the Rust docs etc).
+    #[default]
+    #[serde(rename = "html")]
+    Html,
+    /// Plain text document built from a local checkout referenced by a
+    /// `file://` `url` (the TLA+ source corpus, RAG-6).
+    #[serde(rename = "text")]
+    Text,
+}
+
 /// One pinned corpus document.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Source {
@@ -28,10 +43,14 @@ pub struct Source {
     /// Hex sha256 of the fetched content; `None` until ingested.
     #[serde(default)]
     pub hash: Option<String>,
-    /// Trust tier for retrieval ranking/filtering (defaults to
-    /// `pinned-source`; `docs-wiki` and `navigational` arrive with RAG-6).
+    /// Trust tier for retrieval ranking/filtering (`pinned-source` >
+    /// `docs-wiki` > `navigational`; defaults to `pinned-source`).
     #[serde(default)]
     pub tier: TrustTier,
+    /// How the corpus document is produced: `html` (rendered doc fetched by
+    /// URL) or `text` (source checkout assembled locally).
+    #[serde(default)]
+    pub format: SourceFormat,
 }
 
 /// Provenance rank for retrieval: `pinned-source > docs-wiki > navigational`.
@@ -64,7 +83,10 @@ impl TrustTier {
 impl Source {
     /// Corpus file name this source is stored under (e.g. `rust-book.html`).
     pub fn filename(&self) -> String {
-        format!("{}.html", self.name)
+        match self.format {
+            SourceFormat::Html => format!("{}.html", self.name),
+            SourceFormat::Text => format!("{}.txt", self.name),
+        }
     }
 }
 
@@ -112,6 +134,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn source_format_defaults_to_html() {
+        // A manifest written before RAG-6 (no `format` field) loads as Html.
+        let json =
+            r#"{"name":"rust-book","license":"MIT","url":"https://x","tier":"pinned-source"}"#;
+        let s: Source = serde_json::from_str(json).unwrap();
+        assert_eq!(s.format, SourceFormat::Html);
+        assert_eq!(s.filename(), "rust-book.html");
+    }
+
+    #[test]
+    fn text_source_filename_uses_txt() {
+        let mut s = sample_source();
+        s.format = SourceFormat::Text;
+        assert_eq!(s.filename(), "rust-book.txt");
+    }
+
+    #[test]
+    fn source_format_roundtrips() {
+        for fmt in [SourceFormat::Html, SourceFormat::Text] {
+            let json = serde_json::to_string(&fmt).unwrap();
+            let back: SourceFormat = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, fmt);
+        }
+    }
+
+    #[test]
     fn tier_names_match_serde_renames() {
         assert_eq!(TrustTier::PinnedSource.name(), "pinned-source");
         assert_eq!(TrustTier::DocsWiki.name(), "docs-wiki");
@@ -138,6 +186,7 @@ mod tests {
             url: "https://doc.rust-lang.org/1.95.0/book/print.html".into(),
             hash: None,
             tier: TrustTier::PinnedSource,
+            format: SourceFormat::Html,
         }
     }
 

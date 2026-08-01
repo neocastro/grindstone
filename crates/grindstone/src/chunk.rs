@@ -16,6 +16,11 @@ pub const OVERLAP_TOKENS: usize = 50;
 /// Approximate characters per token used for deterministic estimation.
 pub const CHARS_PER_TOKEN: usize = 4;
 
+/// Marker line prefix separating files inside a text corpus document
+/// (`===== FILE: <relpath> =====`). Text sources are assembled by ingest and
+/// split on these markers by `sections_from_text`.
+pub const FILE_MARKER: &str = "===== FILE: ";
+
 /// One heading-aware slice of a document.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Chunk {
@@ -153,19 +158,79 @@ pub fn estimate_tokens(text: &str) -> usize {
 /// already exceeds the target (then it is split by token windows). Each new
 /// chunk carries the last `OVERLAP_TOKENS` of the previous chunk's text as
 /// overlap, and records the heading of its first section.
+/// Split a text corpus document (Java sources joined by
+/// `===== FILE: <relpath> =====` marker lines) into sections: one per file,
+/// with the file path as the heading. Text before the first marker is a
+/// preamble section with an empty heading (normally absent from
+/// ingest-built documents).
+pub fn sections_from_text(text: &str) -> Vec<Section> {
+    let mut sections: Vec<Section> = Vec::new();
+    let mut current_heading = String::new();
+    let mut current_text = String::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix(FILE_MARKER) {
+            if let Some(path) = rest.strip_suffix(" =====") {
+                flush_text_section(&mut sections, &mut current_heading, &mut current_text);
+                current_heading = path.trim().to_string();
+                continue;
+            }
+        }
+        current_text.push_str(line);
+        current_text.push('\n');
+    }
+    flush_text_section(&mut sections, &mut current_heading, &mut current_text);
+    sections
+}
+
+/// Push the accumulated text section unless it is empty (mirrors
+/// `flush_section`, but preserves code whitespace — collapsing runs of
+/// whitespace would destroy indentation in source files).
+fn flush_text_section(sections: &mut Vec<Section>, heading: &mut String, text: &mut String) {
+    let raw = std::mem::take(text);
+    if !raw.trim().is_empty() || !heading.is_empty() {
+        sections.push(Section {
+            heading: std::mem::take(heading),
+            text: raw,
+        });
+    } else {
+        heading.clear();
+    }
+}
+
+/// Chunk a text corpus document (see `sections_from_text`) with the source's
+/// provenance metadata. Deterministic: same text + source → identical chunks.
+pub fn chunk_text(text: &str, source: &Source) -> Vec<Chunk> {
+    chunk_sections(&sections_from_text(text), source)
+}
+
 pub fn chunk_source(html: &str, source: &Source) -> Vec<Chunk> {
-    let sections = sections_from_html(html);
+    chunk_sections(&sections_from_html(html), source)
+}
+
+/// Merge and split `sections` into ~500-token chunks with overlap; every
+/// chunk carries the source's provenance. Shared by the HTML and text paths.
+fn chunk_sections(sections: &[Section], source: &Source) -> Vec<Chunk> {
     let mut chunks = Vec::new();
     let mut pending = String::new();
     let mut pending_heading = String::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for section in &sections {
+    for section in sections {
+        if section.text.trim().is_empty() {
+            // Empty source file (e.g. several in the tlaplus checkout):
+            // no content, no chunk.
+            continue;
+        }
         let text = section.text.clone();
         if estimate_tokens(&text) > TARGET_TOKENS {
             // Oversized single section: emit what's pending, then split the
             // section by token windows (no overlap within a split section).
             if !pending.is_empty() {
-                chunks.push(make_chunk(source, &pending_heading, &pending));
+                push_unique(
+                    &mut chunks,
+                    &mut seen,
+                    make_chunk(source, &pending_heading, &pending),
+                );
                 pending.clear();
             }
             let mut start = 0;
@@ -173,7 +238,11 @@ pub fn chunk_source(html: &str, source: &Source) -> Vec<Chunk> {
             while start < chars.len() {
                 let end = (start + TARGET_TOKENS * CHARS_PER_TOKEN).min(chars.len());
                 let piece: String = chars[start..end].iter().collect();
-                chunks.push(make_chunk(source, &section.heading, &piece));
+                push_unique(
+                    &mut chunks,
+                    &mut seen,
+                    make_chunk(source, &section.heading, &piece),
+                );
                 start = end;
             }
             pending_heading.clear();
@@ -185,7 +254,11 @@ pub fn chunk_source(html: &str, source: &Source) -> Vec<Chunk> {
         let merged_tokens = estimate_tokens(&pending) + estimate_tokens(&section.text);
         if !pending.is_empty() && merged_tokens > TARGET_TOKENS {
             let overlap = overlap_of(&pending);
-            chunks.push(make_chunk(source, &pending_heading, &pending));
+            push_unique(
+                &mut chunks,
+                &mut seen,
+                make_chunk(source, &pending_heading, &pending),
+            );
             pending = overlap;
             pending_heading = section.heading.clone();
             pending.push(' ');
@@ -198,9 +271,25 @@ pub fn chunk_source(html: &str, source: &Source) -> Vec<Chunk> {
         }
     }
     if !pending.is_empty() {
-        chunks.push(make_chunk(source, &pending_heading, &pending));
+        push_unique(
+            &mut chunks,
+            &mut seen,
+            make_chunk(source, &pending_heading, &pending),
+        );
     }
     chunks
+}
+
+/// Push a chunk unless its content-addressed id was already emitted —
+/// identical text in different files/sections collapses to one chunk.
+fn push_unique(
+    chunks: &mut Vec<Chunk>,
+    seen: &mut std::collections::HashSet<String>,
+    chunk: Chunk,
+) {
+    if seen.insert(chunk.id.clone()) {
+        chunks.push(chunk);
+    }
 }
 
 /// The last `OVERLAP_TOKENS` of `text` (as estimated tokens), for overlap.
@@ -238,6 +327,7 @@ mod tests {
             url: "https://example.invalid/rust-book".into(),
             hash: None,
             tier: TrustTier::PinnedSource,
+            format: crate::manifest::SourceFormat::Html,
         }
     }
 
@@ -404,6 +494,85 @@ mod tests {
         let chunks = chunk_source(&html, &source());
         assert!(chunks.len() >= 2);
         assert_eq!(chunks[0].heading, "Huge");
+    }
+
+    // --- RAG-6: text corpus documents (FILE markers) ---
+
+    #[test]
+    fn sections_from_text_splits_on_file_markers() {
+        let text = "===== FILE: a/A.java =====\nclass A {}\n===== FILE: b/B.tla =====\nMODULE B\n";
+        let sections = sections_from_text(text);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].heading, "a/A.java");
+        assert!(sections[0].text.contains("class A {}"));
+        assert_eq!(sections[1].heading, "b/B.tla");
+        assert!(sections[1].text.contains("MODULE B"));
+    }
+
+    #[test]
+    fn sections_from_text_preamble_has_empty_heading() {
+        let text = "stray preamble\n===== FILE: a.java =====\ncode\n";
+        let sections = sections_from_text(text);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].heading, "");
+        assert!(sections[0].text.contains("stray preamble"));
+        assert_eq!(sections[1].heading, "a.java");
+    }
+
+    #[test]
+    fn chunk_text_carries_provenance_and_file_headings() {
+        let text = "===== FILE: tla2sany/OpApplNode.java =====\npackage tla2sany;\nclass OpApplNode { /* CHOOSE application */ }\n";
+        let chunks = chunk_text(text, &source());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].source, "rust-book"); // source() helper's name
+        assert_eq!(chunks[0].license, "MIT OR Apache-2.0");
+        assert_eq!(chunks[0].tier, TrustTier::PinnedSource);
+        assert_eq!(chunks[0].heading, "tla2sany/OpApplNode.java");
+        assert!(chunks[0].text.contains("class OpApplNode"));
+    }
+
+    #[test]
+    fn chunk_text_is_deterministic() {
+        let text = "===== FILE: a.java =====\nAAAA\n===== FILE: b.java =====\nBBBB\n";
+        let s1 = source();
+        let s2 = source();
+        let c1 = chunk_text(text, &s1);
+        let c2 = chunk_text(text, &s2);
+        assert_eq!(c1.len(), c2.len());
+        assert_eq!(c1[0].id, c2[0].id);
+        assert_eq!(c1[0].text, c2[0].text);
+    }
+    #[test]
+    fn chunk_text_skips_empty_files() {
+        // An empty source file (marker with no content) must not become a
+        // chunk — the tlaplus checkout has several (PcalTLAGen.java etc).
+        let text = "===== FILE: a.java =====\ncode\n===== FILE: empty.java =====\n===== FILE: b.java =====\nmore\n";
+        let chunks = chunk_text(text, &source());
+        assert!(!chunks.is_empty());
+        // The empty file must not produce a chunk, and no chunk is empty
+        // (small sections may merge, so assert the invariants, not a count).
+        assert!(chunks.iter().all(|c| !c.text.trim().is_empty()));
+        assert!(chunks.iter().all(|c| c.heading != "empty.java"));
+    }
+
+    #[test]
+    fn chunk_text_dedups_identical_file_content() {
+        // Two files with byte-identical, oversized content (e.g. the real
+        // PlusCal.tla / PlusCal2.tla copies) produce identical split pieces
+        // whose content-addressed ids must collapse to unique chunks.
+        let body = "LINE ".repeat(600); // 3000 chars ≈ 750 tokens → oversized split
+        let text = format!(
+            "===== FILE: PlusCal.tla =====\n{body}\n===== FILE: PlusCal2.tla =====\n{body}\n"
+        );
+        let chunks = chunk_text(&text, &source());
+        assert!(!chunks.is_empty());
+        let ids: std::collections::HashSet<&String> = chunks.iter().map(|c| &c.id).collect();
+        assert_eq!(
+            ids.len(),
+            chunks.len(),
+            "duplicate content must not produce duplicate chunk ids"
+        );
+        assert!(chunks.iter().any(|c| c.heading == "PlusCal.tla"));
     }
 }
 
