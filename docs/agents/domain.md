@@ -1,6 +1,7 @@
 # Domain Docs
 
-Single context for grindstone's domain vocabulary.
+Single context for grindstone's domain vocabulary. For how these terms map
+to modules, data flow, and tests, see [`modules.md`](modules.md).
 
 ## Glossary
 
@@ -26,7 +27,9 @@ _Avoid_: "paragraph" — chunks are structural units, not prose units.
 
 **Embedding**:
 The vector representation of a chunk, produced by `nomic-embed-text` via the
-local Ollama server.
+local Ollama server. The embedder is a **seam**: production uses
+`ollama_embed`, tests inject a deterministic fake so the determinism contract
+holds without Ollama.
 
 **Index build**:
 The library module that owns the whole pipeline walk end-to-end —
@@ -34,18 +37,32 @@ manifest → corpus files → chunks → embeddings → vector store
 (`indexbuild::build_index`). The determinism contract lives here: same
 manifest + same corpus → identical index artifacts, bit-for-bit. The CLI
 stays per-stage (`gs chunk`, `gs embed`) but delegates the walks to Index
-build.
+build; retrieval consumers load through `indexbuild::load_index` (store +
+sparse index) or `indexbuild::load_vector_store` (store only).
 _Avoid_: "the pipeline" when the library's orchestration path is meant — the
 CLI's per-stage commands are entry points, not the walk.
+
+**Searcher seam**:
+The fulltext baseline's pluggable adapter, `fulltext::Searcher` (corpus dir +
+query → ranked hits): `RipgrepSearcher` when `rg` is on PATH,
+`InProcessSearcher` (deterministic pure-Rust scan) otherwise — so the
+baseline runs anywhere, including CI. `fulltext::default_searcher()` picks
+per environment. See ADR-0002.
+
+**Strategy seam**:
+The retrieval-quality pluggable path, `eval::Strategy` (query → ranked doc
+ids). The library owns the adapters as constructors — `fulltext_strategy`,
+`cosine_strategy`, `hybrid_strategy` — and the CLI only picks a name. Every
+strategy must measurably beat the previous on the eval harness. See ADR-0004.
 
 **Vector store**:
 The persisted chunk + embedding + metadata index (deterministic JSON artifacts + in-memory cosine at this scale — see RAG-4).
 _Avoid_: "database" when referring to the index.
 
 **Retrieval strategy**:
-A pluggable query path: full-text baseline → cosine → BM25 hybrid →
-cross-encoder rerank. Each rung must measurably beat the previous on the eval
-harness.
+A pluggable query path behind the **strategy seam**: full-text baseline →
+cosine → BM25 hybrid (cross-encoder rerank is the roadmap rung after that).
+Each rung must measurably beat the previous on the eval harness.
 _Avoid_: "search mode" — strategies are measured, not selected by taste.
 
 **Eval harness**:
@@ -71,7 +88,9 @@ the mechanism.
 - **Index build** walks a **manifest** and **corpus** to **chunks**, then to
   **embeddings**, assembling the **vector store**
 - **Chunks** are embedded and stored in the **vector store**
-- A **retrieval strategy** queries the **vector store**
+- The **searcher seam** serves the full-text baseline over the **corpus**
+- A **retrieval strategy** queries the **vector store** (or the corpus, for
+  the full-text baseline), all behind the **strategy seam**
 - The **eval harness** scores every **retrieval strategy**
 - `gs build-prompt` consumes untrusted issue text and emits a prompt with the
   **untrusted-data frame**, then grounds the implementer by injecting top-k
