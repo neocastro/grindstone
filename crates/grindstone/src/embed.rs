@@ -99,6 +99,21 @@ pub fn ollama_embed(
 /// production uses `ollama_embed`).
 pub type Embedder<'a> = dyn FnMut(&[String]) -> Result<Vec<Vec<f32>>, EmbedError> + 'a;
 
+/// Embed a single query and return its vector, erroring if the embedder
+/// returns no vectors.
+///
+/// The one shared "embed the query, take the first vector, error if empty"
+/// path — used by library retrieval ([`crate::retrieve_context`]), the eval
+/// strategy adapters, and the CLI dense query (each previously re-implemented
+/// the same three steps, with the CLI indexing `[0]` unguarded).
+pub fn embed_query_vector(embed: &mut Embedder, query: &str) -> Result<Vec<f32>, EmbedError> {
+    let vectors = embed(&[query.to_string()])?;
+    vectors
+        .into_iter()
+        .next()
+        .ok_or_else(|| EmbedError::Http("embedder returned no vectors".into()))
+}
+
 /// Embed every chunk in order, batched, keyed by chunk id.
 ///
 /// `call` is the injectable embedder. Returns an `EmbeddingsFile` with a
