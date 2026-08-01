@@ -15,19 +15,21 @@ use std::path::Path;
 /// Fetch a URL's bytes. Injected so tests can run fully offline.
 pub type Fetcher<'a> = dyn FnMut(&str) -> Result<Vec<u8>, IngestError> + 'a;
 
-/// Fetch `url` over HTTPS via ureq (the production fetcher).
+/// Fetch `url` over HTTPS via reqwest (the production fetcher; blocking,
+/// rustls TLS — no system OpenSSL dependency).
 pub fn http_fetcher(url: &str) -> Result<Vec<u8>, IngestError> {
-    let agent = ureq::AgentBuilder::new()
+    let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
-        .build();
-    let response = agent
+        .build()
+        .map_err(|e| IngestError::Http(format!("cannot build HTTP client: {e}")))?;
+    let response = client
         .get(url)
-        .call()
+        .send()
         .map_err(|e| IngestError::Http(format!("{url}: {e}")))?;
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut response.into_reader(), &mut bytes)
+    let bytes = response
+        .bytes()
         .map_err(|e| IngestError::Http(format!("{url}: read failed: {e}")))?;
-    Ok(bytes)
+    Ok(bytes.to_vec())
 }
 
 /// Outcome for one source during an ingest run.
@@ -153,6 +155,7 @@ impl From<ManifestError> for IngestError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::TrustTier;
     use std::collections::{HashMap, HashSet};
 
     fn source(name: &str, url: &str, hash: Option<&str>) -> Source {
@@ -161,6 +164,7 @@ mod tests {
             license: "MIT OR Apache-2.0".into(),
             url: url.into(),
             hash: hash.map(String::from),
+            tier: TrustTier::PinnedSource,
         }
     }
 
