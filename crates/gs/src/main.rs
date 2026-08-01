@@ -3,7 +3,7 @@
 use grindstone::{
     bm25, build_prompt, build_prompt_with_context, chunk, embed, eval, fulltext, hybrid, ingest,
     manifest,
-    manifest::{Manifest, SourceFormat, TrustTier},
+    manifest::{Manifest, TrustTier},
     retrieve_context,
     vector::{self, VectorStore},
     Issue,
@@ -624,10 +624,7 @@ fn cmd_chunk(mut args: impl Iterator<Item = String>) {
                 std::process::exit(1);
             }
         };
-        let doc_chunks = match source.format {
-            SourceFormat::Html => chunk::chunk_source(&content, source),
-            SourceFormat::Text => chunk::chunk_text(&content, source),
-        };
+        let doc_chunks = chunk::chunk(&content, source);
         println!("{:>6} chunks  {}", doc_chunks.len(), source.name);
         chunks.extend(doc_chunks);
     }
