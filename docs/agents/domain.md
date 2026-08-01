@@ -59,4 +59,6 @@ the mechanism.
 - A **retrieval strategy** queries the **vector store**
 - The **eval harness** scores every **retrieval strategy**
 - `gs build-prompt` consumes untrusted issue text and emits a prompt with the
-  **untrusted-data frame**
+  **untrusted-data frame**, then grounds the implementer by injecting top-k
+  **chunks** for the issue between the frame and the working rules
+  (retrieve-then-inject, RAG-5)
