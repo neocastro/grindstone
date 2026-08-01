@@ -5,31 +5,73 @@
       "name": "rust-book",
       "license": "MIT OR Apache-2.0",
       "url": "https://doc.rust-lang.org/book/print.html",
-      "hash": "73adfd2bd513655f9b9148d102aa94bc7da94ea97581849f71987973d519849b"
+      "hash": "73adfd2bd513655f9b9148d102aa94bc7da94ea97581849f71987973d519849b",
+      "tier": "pinned-source",
+      "format": "html"
     },
     {
       "name": "rust-by-example",
       "license": "MIT OR Apache-2.0",
       "url": "https://doc.rust-lang.org/rust-by-example/print.html",
-      "hash": "34343c414163e86193bb512d12fd01e0091270e4553cbd6cc3e09f2480e2b1f5"
+      "hash": "34343c414163e86193bb512d12fd01e0091270e4553cbd6cc3e09f2480e2b1f5",
+      "tier": "pinned-source",
+      "format": "html"
     },
     {
       "name": "rust-reference",
       "license": "MIT OR Apache-2.0",
       "url": "https://doc.rust-lang.org/reference/print.html",
-      "hash": "d0be2ec93f2cd965899af841f6e45f92c05a655154da7aa9965869c83649800c"
+      "hash": "d0be2ec93f2cd965899af841f6e45f92c05a655154da7aa9965869c83649800c",
+      "tier": "pinned-source",
+      "format": "html"
     },
     {
       "name": "rustonomicon",
       "license": "MIT OR Apache-2.0",
       "url": "https://doc.rust-lang.org/nomicon/print.html",
-      "hash": "23dec15a65d43dbde9162f9001e5023a780bc2707c4e3360aa31168ac379f3f3"
+      "hash": "23dec15a65d43dbde9162f9001e5023a780bc2707c4e3360aa31168ac379f3f3",
+      "tier": "pinned-source",
+      "format": "html"
     },
     {
       "name": "clippy",
       "license": "MIT OR Apache-2.0",
       "url": "https://rust-lang.github.io/rust-clippy/master/index.html",
-      "hash": "d4babdb31f5ae3fdaa46ce50033542073c6b2312701bbd336739a1e0c29132fe"
+      "hash": "d4babdb31f5ae3fdaa46ce50033542073c6b2312701bbd336739a1e0c29132fe",
+      "tier": "pinned-source",
+      "format": "html"
+    },
+    {
+      "name": "tlaplus",
+      "license": "MIT",
+      "url": "file:///home/neo/dev/algebraik/tlaplus/tlatools/org.lamport.tlatools/src",
+      "hash": "c7924a8e5074e5e62fb95409b28279c81d9269fa7e8d85e3f2a6c0606d770669",
+      "tier": "pinned-source",
+      "format": "text"
+    },
+    {
+      "name": "tlaplus-wiki-start",
+      "license": "unknown",
+      "url": "https://docs.tlapl.us/_export/xhtml/codebase:start",
+      "hash": "e619c4591c35a9e96a98e75b863ce3cf47c136863ef4013e5764fc3d199cca18",
+      "tier": "docs-wiki",
+      "format": "html"
+    },
+    {
+      "name": "tlaplus-wiki-idiosyncrasies",
+      "license": "unknown",
+      "url": "https://docs.tlapl.us/_export/xhtml/codebase:idiosyncrasies",
+      "hash": "b4600806eff4ff892ca62a7092d8a3ce5e0fd22afcf0f67dc19c6f9d88a68a8c",
+      "tier": "docs-wiki",
+      "format": "html"
+    },
+    {
+      "name": "tlaplus-wiki-liveness",
+      "license": "unknown",
+      "url": "https://docs.tlapl.us/_export/xhtml/codebase:liveness",
+      "hash": "5884accb0d0a71edf4f518403abc78facb2c1745c03eec29e17cf98b08d6565d",
+      "tier": "docs-wiki",
+      "format": "html"
     }
   ]
 }

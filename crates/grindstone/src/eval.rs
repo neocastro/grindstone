@@ -162,7 +162,13 @@ pub fn fulltext_doc_ids(corpus_dir: &Path, query: &str) -> Result<Vec<String>, E
     let hits = crate::fulltext::search(corpus_dir, query).map_err(EvalError::Fulltext)?;
     Ok(hits
         .into_iter()
-        .map(|h| h.file.strip_suffix(".html").unwrap_or(&h.file).to_string())
+        .map(|h| {
+            h.file
+                .rsplit_once('.')
+                .map(|(s, _)| s)
+                .unwrap_or(&h.file)
+                .to_string()
+        })
         .collect())
 }
 

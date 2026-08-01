@@ -9,6 +9,7 @@
 //! - Ingest always writes a resolved manifest (with content hashes filled
 //!   in) to `corpus_dir/manifest.json`.
 
+use crate::chunk::FILE_MARKER;
 use crate::manifest::{sha256_hex, Manifest, ManifestError, Source};
 use std::path::Path;
 
@@ -30,6 +31,68 @@ pub fn http_fetcher(url: &str) -> Result<Vec<u8>, IngestError> {
         .bytes()
         .map_err(|e| IngestError::Http(format!("{url}: read failed: {e}")))?;
     Ok(bytes.to_vec())
+}
+
+/// Build the corpus document for a `file://` text source.
+///
+/// A directory URL (the TLA+ source checkout) is assembled into one
+/// deterministic document: every `*.java` and `*.tla` file beneath it, in
+/// sorted relative-path order, joined by `===== FILE: <relpath> =====`
+/// marker lines (the heading the chunker uses for text sources). A plain
+/// file URL is read verbatim. Same checkout → identical bytes, so the
+/// manifest hash pins the document exactly like it pins fetched HTML.
+pub fn local_text_fetcher(url: &str) -> Result<Vec<u8>, IngestError> {
+    let raw = url.strip_prefix("file://").ok_or_else(|| {
+        IngestError::Io(std::io::Error::other(format!("not a file:// url: {url}")))
+    })?;
+    let path = Path::new(raw);
+    if !path.exists() {
+        return Err(IngestError::Io(std::io::Error::other(format!(
+            "local source not found: {} (is the pinned checkout present?)",
+            path.display()
+        ))));
+    }
+    if path.is_file() {
+        return std::fs::read(path).map_err(IngestError::Io);
+    }
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    collect_source_files(path, &mut files)?;
+    files.sort();
+    let mut doc = String::new();
+    for f in &files {
+        let rel = f
+            .strip_prefix(path)
+            .unwrap_or(f)
+            .to_string_lossy()
+            .to_string();
+        let bytes = std::fs::read(f).map_err(IngestError::Io)?;
+        let text = String::from_utf8_lossy(&bytes);
+        doc.push_str(&format!("{FILE_MARKER}{rel} =====\n"));
+        doc.push_str(&text);
+        doc.push('\n');
+    }
+    Ok(doc.into_bytes())
+}
+
+/// Collect source files under `dir`, recursively. Caller sorts for a
+/// deterministic document order.
+fn collect_source_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<(), IngestError> {
+    for entry in std::fs::read_dir(dir).map_err(IngestError::Io)? {
+        let entry = entry.map_err(IngestError::Io)?;
+        let p = entry.path();
+        if p.is_dir() {
+            collect_source_files(&p, out)?;
+        } else if is_source_file(&p) {
+            out.push(p);
+        }
+    }
+    Ok(())
+}
+
+/// The file extensions that make up a text corpus document: source + spec
+/// files (Java + TLA+ for the tlaplus checkout).
+fn is_source_file(p: &Path) -> bool {
+    matches!(p.extension().and_then(|e| e.to_str()), Some("java" | "tla"))
 }
 
 /// Outcome for one source during an ingest run.
@@ -165,6 +228,7 @@ mod tests {
             url: url.into(),
             hash: hash.map(String::from),
             tier: TrustTier::PinnedSource,
+            format: crate::manifest::SourceFormat::Html,
         }
     }
 
@@ -375,5 +439,69 @@ mod tests {
     #[allow(dead_code)]
     fn _manifest_error_conversion(e: ManifestError) -> IngestError {
         e.into()
+    }
+
+    // --- RAG-6: local text fetcher (file:// sources) ---
+
+    fn write_tree(root: &std::path::Path, files: &[(&str, &str)]) {
+        std::fs::create_dir_all(root).unwrap();
+        for (rel, content) in files {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, content).unwrap();
+        }
+    }
+
+    #[test]
+    fn local_text_fetcher_builds_deterministic_marked_document() {
+        let dir = corpus_dir("textdoc");
+        // Creation order deliberately unsorted; the document must be sorted.
+        write_tree(
+            &dir,
+            &[
+                ("b/B.java", "class B {}\n"),
+                ("a/A.java", "class A {}\n"),
+                ("notes.txt", "not a source file\n"),
+                ("c/M.tla", "MODULE M\n"),
+            ],
+        );
+        let url = format!("file://{}", dir.display());
+        let doc1 = local_text_fetcher(&url).unwrap();
+        let doc2 = local_text_fetcher(&url).unwrap();
+        assert_eq!(doc1, doc2, "deterministic across runs");
+        let text = String::from_utf8(doc1).unwrap();
+        let a = text.find("===== FILE: a/A.java =====").unwrap();
+        let b = text.find("===== FILE: b/B.java =====").unwrap();
+        let c = text.find("===== FILE: c/M.tla =====").unwrap();
+        assert!(a < b && b < c, "files sorted by relative path");
+        assert!(text.contains("class A {}"));
+        assert!(text.contains("class B {}"));
+        assert!(text.contains("MODULE M"));
+        assert!(
+            !text.contains("not a source file"),
+            "non-source files excluded"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn local_text_fetcher_reads_single_file_verbatim() {
+        let dir = corpus_dir("textfile");
+        write_tree(&dir, &[("doc.txt", "hello world\n")]);
+        let url = format!("file://{}", dir.join("doc.txt").display());
+        assert_eq!(local_text_fetcher(&url).unwrap(), b"hello world\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn local_text_fetcher_missing_path_errors() {
+        let err = local_text_fetcher("file:///nonexistent/gs-tlaplus-checkout").unwrap_err();
+        assert!(matches!(err, IngestError::Io(_)));
+    }
+
+    #[test]
+    fn local_text_fetcher_rejects_non_file_url() {
+        let err = local_text_fetcher("https://example.invalid/x").unwrap_err();
+        assert!(matches!(err, IngestError::Io(_)));
     }
 }
