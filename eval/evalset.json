@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "queries": [
+    {
+      "id": "rust-borrow-checker",
+      "query": "borrow checker",
+      "expected": ["rust-book", "rust-reference"]
+    },
+    {
+      "id": "rust-drop-check",
+      "query": "drop check",
+      "expected": ["rustonomicon", "rust-reference"]
+    },
+    {
+      "id": "rust-variance",
+      "query": "variance",
+      "expected": ["rustonomicon", "rust-reference"]
+    },
+    {
+      "id": "rust-deref-coercion",
+      "query": "deref coercion",
+      "expected": ["rust-book", "rust-reference"]
+    },
+    {
+      "id": "rust-propagating-errors",
+      "query": "propagating errors",
+      "expected": ["rust-book"]
+    },
+    {
+      "id": "rust-restriction-lints",
+      "query": "restriction lints",
+      "expected": ["clippy"]
+    },
+    {
+      "id": "rust-format-string",
+      "query": "format string",
+      "expected": ["rust-book", "rust-by-example", "rust-reference"]
+    },
+    {
+      "id": "rust-auto-traits",
+      "query": "auto traits",
+      "expected": ["rust-reference", "rustonomicon"]
+    },
+    {
+      "id": "rust-maybeuninit",
+      "query": "MaybeUninit",
+      "expected": ["rustonomicon", "rust-reference"]
+    },
+    {
+      "id": "rust-pinning",
+      "query": "pinning",
+      "expected": ["rust-book", "rustonomicon"]
+    },
+    {
+      "id": "tla-choose",
+      "query": "CHOOSE",
+      "expected": ["tlaplus"]
+    },
+    {
+      "id": "tla-except",
+      "query": "EXCEPT",
+      "expected": ["tlaplus"]
+    },
+    {
+      "id": "tla-model-value",
+      "query": "model value",
+      "expected": ["tlaplus"]
+    }
+  ]
+}

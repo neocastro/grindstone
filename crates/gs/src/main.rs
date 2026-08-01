@@ -1,11 +1,13 @@
 //! gs — grindstone CLI.
 
-use grindstone::{build_prompt, fulltext, ingest, manifest::Manifest, Issue};
+use grindstone::{build_prompt, eval, fulltext, ingest, manifest, manifest::Manifest, Issue};
 use std::io::Read;
 use std::path::PathBuf;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CORPUS_DIR: &str = "corpus";
+const DEFAULT_EVAL_SET: &str = "eval/evalset.json";
+const BASELINE_RESULT: &str = "eval/results/fulltext-baseline.json";
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -23,6 +25,7 @@ fn main() {
         Some("build-prompt") => cmd_build_prompt(args),
         Some("ingest") => cmd_ingest(args),
         Some("query") => cmd_query(args),
+        Some("eval") => cmd_eval(args),
         Some("-h" | "--help") => usage(),
         Some(other) => {
             eprintln!("gs: unknown subcommand `{other}`");
@@ -40,6 +43,7 @@ fn usage() {
     eprintln!("usage: gs build-prompt [REPO]   (issue JSON on stdin)");
     eprintln!("       gs ingest [CORPUS_DIR]   (default: corpus)");
     eprintln!("       gs query QUERY [CORPUS_DIR]   (default: corpus)");
+    eprintln!("       gs eval [CORPUS_DIR] [EVAL_SET]   (defaults: corpus, eval/evalset.json)");
     eprintln!("       gs --version");
 }
 
@@ -131,6 +135,86 @@ fn cmd_query(mut args: impl Iterator<Item = String>) {
         }
         Err(e) => {
             eprintln!("gs query: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `gs eval [CORPUS_DIR] [EVAL_SET]` — run the full-text baseline over the
+/// eval set, print recall@k (k=5, k=10) per query and overall, and persist
+/// the result to `eval/results/fulltext-baseline.json` so later retrieval
+/// strategies have a number to beat on the same eval set. Fully offline.
+fn cmd_eval(mut args: impl Iterator<Item = String>) {
+    let corpus_dir = PathBuf::from(
+        args.next()
+            .unwrap_or_else(|| DEFAULT_CORPUS_DIR.to_string()),
+    );
+    let eval_set_path = PathBuf::from(args.next().unwrap_or_else(|| DEFAULT_EVAL_SET.to_string()));
+
+    let set = match eval::EvalSet::load(&eval_set_path) {
+        Ok(set) => set,
+        Err(e) => {
+            eprintln!("gs eval: cannot load {}: {e}", eval_set_path.display());
+            std::process::exit(2);
+        }
+    };
+    let problems = set.validate();
+    if !problems.is_empty() {
+        for p in &problems {
+            eprintln!("gs eval: invalid eval set: {p}");
+        }
+        std::process::exit(2);
+    }
+
+    // Corpus hash ties the recorded score to the corpus state (deterministic,
+    // no wall-clock timestamps — reproducibility).
+    let manifest_path = corpus_dir.join("manifest.json");
+    let corpus_hash = std::fs::read(&manifest_path)
+        .map(|bytes| manifest::sha256_hex(&bytes))
+        .unwrap_or_default();
+
+    // Warn about expected doc ids that are not in the corpus yet (e.g. the
+    // TLA+ doc id before RAG-6 lands): they score 0 until that corpus exists.
+    let known_docs: std::collections::HashSet<String> = Manifest::load(&manifest_path)
+        .map(|m| m.sources.iter().map(|s| s.name.clone()).collect())
+        .unwrap_or_default();
+    for q in &set.queries {
+        for expected in &q.expected {
+            if !known_docs.is_empty() && !known_docs.contains(expected) {
+                eprintln!(
+                    "gs eval: warning: expected doc '{expected}' for '{}' is not in the corpus (scores 0 until it lands)",
+                    q.id
+                );
+            }
+        }
+    }
+
+    let mut strategy = |query: &str| eval::fulltext_doc_ids(&corpus_dir, query);
+    let mut result = match eval::run_eval("fulltext", &mut strategy, &set) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("gs eval: {e}");
+            std::process::exit(1);
+        }
+    };
+    result.corpus_hash = corpus_hash;
+
+    for q in &result.queries {
+        println!(
+            "recall@5 {:>5.3}  recall@10 {:>5.3}  {:<24} {}",
+            q.recall_5, q.recall_10, q.id, q.query
+        );
+    }
+    println!(
+        "overall recall@5 {:>5.3}  recall@10 {:>5.3}  (strategy: {})",
+        result.overall_recall_5, result.overall_recall_10, result.strategy
+    );
+
+    let result_path = PathBuf::from(BASELINE_RESULT);
+    match eval::save_result(&result_path, &result) {
+        Ok(()) => println!("saved {}", result_path.display()),
+        Err(e) => {
+            eprintln!("gs eval: cannot write {}: {e}", result_path.display());
             std::process::exit(1);
         }
     }
