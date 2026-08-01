@@ -2,7 +2,6 @@
 
 use grindstone::{
     bm25, build_prompt, build_prompt_with_context, chunk, embed, eval, fulltext, hybrid, ingest,
-    manifest,
     manifest::{Manifest, TrustTier},
     retrieve_context,
     vector::{self, VectorStore},
@@ -317,10 +316,10 @@ fn cmd_query_dense(
             std::process::exit(1);
         }
     };
-    let call =
+    let mut call =
         |inputs: &[String]| embed::ollama_embed(server_url, embed::DEFAULT_EMBED_MODEL, inputs);
-    let vectors = match call(&[query.to_string()]) {
-        Ok(v) => v,
+    let q = match embed::embed_query_vector(&mut call, query) {
+        Ok(q) => q,
         Err(e) => {
             eprintln!("gs query: {e}");
             std::process::exit(1);
@@ -336,16 +335,9 @@ fn cmd_query_dense(
             }
         };
         let index = bm25::Bm25Index::build(&chunks);
-        hybrid::hybrid_search(
-            &store,
-            &index,
-            &vectors[0],
-            query,
-            vector::DEFAULT_TOP_K,
-            tier,
-        )
+        hybrid::hybrid_search(&store, &index, &q, query, vector::DEFAULT_TOP_K, tier)
     } else {
-        store.search(&vectors[0], vector::DEFAULT_TOP_K, tier)
+        store.search(&q, vector::DEFAULT_TOP_K, tier)
     };
     if hits.is_empty() {
         println!(
@@ -443,12 +435,7 @@ fn cmd_eval(mut args: impl Iterator<Item = String>) {
         std::process::exit(2);
     }
 
-    // Corpus hash ties the recorded score to the corpus state (deterministic,
-    // no wall-clock timestamps — reproducibility).
     let manifest_path = corpus_dir.join("manifest.json");
-    let corpus_hash = std::fs::read(&manifest_path)
-        .map(|bytes| manifest::sha256_hex(&bytes))
-        .unwrap_or_default();
 
     // Warn about expected doc ids that are not in the corpus yet (e.g. the
     // TLA+ doc id before RAG-6 lands): they score 0 until that corpus exists.
@@ -520,16 +507,12 @@ fn cmd_eval(mut args: impl Iterator<Item = String>) {
             (
                 PathBuf::from(HYBRID_RESULT),
                 Box::new(move |query: &str| {
-                    let call = |inputs: &[String]| {
+                    let mut call = |inputs: &[String]| {
                         embed::ollama_embed(&server_url, embed::DEFAULT_EMBED_MODEL, inputs)
                     };
-                    let vectors = call(&[query.to_string()]).map_err(eval::EvalError::Embed)?;
-                    let q = vectors.first().ok_or_else(|| {
-                        eval::EvalError::Embed(embed::EmbedError::Http(
-                            "embedder returned no vectors".into(),
-                        ))
-                    })?;
-                    Ok(eval::hybrid_doc_ids(&store, &index, query, q))
+                    let q = embed::embed_query_vector(&mut call, query)
+                        .map_err(eval::EvalError::Embed)?;
+                    Ok(eval::hybrid_doc_ids(&store, &index, query, &q))
                 }),
             )
         }
@@ -539,14 +522,15 @@ fn cmd_eval(mut args: impl Iterator<Item = String>) {
         }
     };
 
-    let mut result = match eval::run_eval(&strategy_name, &mut strategy, &set) {
+    // The harness owns its result: it computes corpus_hash from the manifest
+    // (RAG-11a), so the CLI has nothing to patch back.
+    let result = match eval::run_eval(&strategy_name, &mut strategy, &set, &manifest_path) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("gs eval: {e}");
             std::process::exit(1);
         }
     };
-    result.corpus_hash = corpus_hash;
 
     for q in &result.queries {
         println!(

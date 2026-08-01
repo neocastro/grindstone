@@ -126,11 +126,8 @@ pub fn retrieve_context(
 ) -> Result<Vec<Chunk>, PromptError> {
     let store = VectorStore::load(index_dir)?;
     let query = format!("{}\n{}", issue.title.trim(), issue.body.trim());
-    let vectors = embed_call(&[query])?;
-    let q = vectors.first().ok_or_else(|| {
-        PromptError::Embed(EmbedError::Http("embedder returned no vectors".into()))
-    })?;
-    let hits = store.search(q, top_k, None);
+    let q = crate::embed::embed_query_vector(embed_call, &query)?;
+    let hits = store.search(&q, top_k, None);
     Ok(hits.into_iter().map(|h| h.chunk).collect())
 }
 

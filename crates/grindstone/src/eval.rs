@@ -104,10 +104,17 @@ pub struct EvalResult {
 pub type Strategy<'a> = dyn FnMut(&str) -> Result<Vec<String>, EvalError> + 'a;
 
 /// Run `strategy` over every query in `set` and score recall@5 and recall@10.
+///
+/// The harness owns its result: `corpus_hash` is computed here from the
+/// corpus manifest (`manifest_path`), so a persisted score always carries
+/// the corpus state it was measured against — the caller never patches it.
+/// A missing manifest (corpus not built yet) yields an empty hash, matching
+/// the pre-RAG-11a CLI behavior.
 pub fn run_eval(
     strategy_name: &str,
     strategy: &mut Strategy,
     set: &EvalSet,
+    manifest_path: &Path,
 ) -> Result<EvalResult, EvalError> {
     let mut scores = Vec::with_capacity(set.queries.len());
     for q in &set.queries {
@@ -122,9 +129,12 @@ pub fn run_eval(
             hits,
         });
     }
+    let corpus_hash = std::fs::read(manifest_path)
+        .map(|bytes| crate::manifest::sha256_hex(&bytes))
+        .unwrap_or_default();
     Ok(EvalResult {
         strategy: strategy_name.to_string(),
-        corpus_hash: String::new(),
+        corpus_hash,
         overall_recall_5: mean(&scores, |s| s.recall_5),
         overall_recall_10: mean(&scores, |s| s.recall_10),
         queries: scores,
@@ -181,24 +191,11 @@ pub fn fulltext_doc_ids(
         .collect())
 }
 
-/// Cosine strategy adapter: embed `query` via the injectable embedder, rank
-/// chunks through the vector store, and map the top-k hits to doc ids
-/// (deduped source names, rank order preserved).
-///
-/// A document with many matching chunks appears once, at its best position —
-/// the same doc-id granularity the full-text baseline is scored on.
-pub fn cosine_doc_ids(
-    store: &crate::vector::VectorStore,
-    embed: &mut crate::embed::Embedder,
-    query: &str,
-) -> Result<Vec<String>, EvalError> {
-    let embeddings = embed(&[query.to_string()]).map_err(EvalError::Embed)?;
-    let q = embeddings.first().ok_or_else(|| {
-        EvalError::Embed(crate::embed::EmbedError::Http(
-            "embedder returned no vectors".into(),
-        ))
-    })?;
-    let hits = store.search(q, crate::vector::DEFAULT_TOP_K, None);
+/// Map ranked hits to deduped doc ids (source names), preserving rank order:
+/// a document with many matching chunks appears once, at its best position —
+/// the same doc-id granularity the full-text baseline is scored on. The one
+/// shared helper, used by both the cosine and hybrid strategy adapters.
+fn dedup_doc_ids(hits: Vec<crate::vector::Hit>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut doc_ids = Vec::new();
     for hit in hits {
@@ -206,7 +203,20 @@ pub fn cosine_doc_ids(
             doc_ids.push(hit.chunk.source);
         }
     }
-    Ok(doc_ids)
+    doc_ids
+}
+
+/// Cosine strategy adapter: embed `query` via the injectable embedder, rank
+/// chunks through the vector store, and map the top-k hits to doc ids
+/// (deduped source names, rank order preserved).
+pub fn cosine_doc_ids(
+    store: &crate::vector::VectorStore,
+    embed: &mut crate::embed::Embedder,
+    query: &str,
+) -> Result<Vec<String>, EvalError> {
+    let q = crate::embed::embed_query_vector(embed, query).map_err(EvalError::Embed)?;
+    let hits = store.search(&q, crate::vector::DEFAULT_TOP_K, None);
+    Ok(dedup_doc_ids(hits))
 }
 
 /// Hybrid strategy adapter: fuse BM25 + cosine for `query` (the embedding is
@@ -226,14 +236,7 @@ pub fn hybrid_doc_ids(
         crate::vector::DEFAULT_TOP_K,
         None,
     );
-    let mut seen = std::collections::HashSet::new();
-    let mut doc_ids = Vec::new();
-    for hit in hits {
-        if seen.insert(hit.chunk.source.clone()) {
-            doc_ids.push(hit.chunk.source);
-        }
-    }
-    doc_ids
+    dedup_doc_ids(hits)
 }
 
 /// Errors produced by the eval harness.
@@ -310,6 +313,12 @@ mod tests {
 
     #[test]
     fn run_eval_scores_per_query_and_overall() {
+        let dir = std::env::temp_dir().join(format!("gs-eval-score-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest_bytes = b"{\"sources\": []}";
+        let manifest = dir.join("manifest.json");
+        std::fs::write(&manifest, manifest_bytes).unwrap();
         let set = sample_set();
         // Fake strategy: q1 → [rust-book, other], q2 → [unrelated]
         let mut strategy = |q: &str| -> Result<Vec<String>, EvalError> {
@@ -319,7 +328,14 @@ mod tests {
                 _ => vec![],
             })
         };
-        let result = run_eval("fake", &mut strategy, &set).unwrap();
+        let result = run_eval("fake", &mut strategy, &set, &manifest).unwrap();
+
+        // The harness owns the corpus hash: filled here, matching the
+        // manifest's content hash (no caller patch-back).
+        assert_eq!(
+            result.corpus_hash,
+            crate::manifest::sha256_hex(manifest_bytes)
+        );
 
         // q1: 1/2 expected in top-5 and top-10 → 0.5
         // q2: 0/1 → 0.0
@@ -331,6 +347,7 @@ mod tests {
         assert_eq!(result.overall_recall_5, 0.25);
         assert_eq!(result.overall_recall_10, 0.25);
         assert_eq!(result.strategy, "fake");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -408,6 +425,10 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("other.html"), b"nothing relevant\n").unwrap();
+        // A manifest pins the corpus state; the harness hashes it into the
+        // result (RAG-11a).
+        let manifest_bytes = b"{\"version\": 1, \"sources\": [{\"name\": \"rust-book\"}]}";
+        std::fs::write(dir.join("manifest.json"), manifest_bytes).unwrap();
 
         let set = EvalSet {
             version: 1,
@@ -421,9 +442,13 @@ mod tests {
         // keeps this baseline test running even when `rg` is absent (CI).
         let searcher = crate::fulltext::InProcessSearcher;
         let mut strategy = |q: &str| fulltext_doc_ids(&searcher, &dir, q);
-        let result = run_eval("fulltext", &mut strategy, &set).unwrap();
+        let result = run_eval("fulltext", &mut strategy, &set, &dir.join("manifest.json")).unwrap();
         assert_eq!(result.queries[0].hits, vec!["rust-book".to_string()]);
         assert_eq!(result.queries[0].recall_5, 1.0);
+        assert_eq!(
+            result.corpus_hash,
+            crate::manifest::sha256_hex(manifest_bytes)
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
